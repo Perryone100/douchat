@@ -234,3 +234,47 @@ it('escalates conflicting silence and premature completion without silently drop
     await expect(new GroupDecisionService(request).decide(settings, provider, group, context, signal)).rejects.toThrow('no-reply')
   }
 })
+
+it('streams a low-reasoning DeepSeek plan without changing another provider payload', async () => {
+  const request = vi.fn<typeof fetch>(async () => new Response('data: {"choices":[{"delta":{"reasoning_content":"private"}}]}\n\ndata: {"choices":[{"delta":{"content":"{\\"ok\\":true}"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } }))
+  const progress = vi.fn(), service = new GroupDecisionService(request)
+  expect(await service.complete({ ...provider, apiBase: 'https://api.deepseek.com' }, 'deepseek-flash', 'JSON', signal, undefined, progress)).toBe('{"ok":true}')
+  expect(JSON.parse(request.mock.calls[0][1]!.body as string)).toMatchObject({ stream: true, thinking: { type: 'enabled' }, reasoning_effort: 'low' })
+  expect(progress).toHaveBeenCalledTimes(2)
+  await service.complete({ ...provider, apiBase: 'https://example.test/v1' }, 'other', 'JSON', signal)
+  expect(JSON.parse(request.mock.calls[1][1]!.body as string)).not.toHaveProperty('thinking')
+})
+it.each([false, true])('does not retry transport failure as schema correction, lightweight=%s', async lightweight => {
+  const request = vi.fn<typeof fetch>(async () => new Response('private diagnostic', { status: 429 }))
+  await expect(new GroupDecisionService(request).plan({ ...provider, apiBase: 'https://fixture.test/v1' }, 'ordinary', group, context, signal, group.members[0], lightweight)).rejects.toThrow('HTTP 429')
+  expect(request).toHaveBeenCalledOnce()
+})
+
+it('keeps a configured streaming decision alive beyond 40 and 60 seconds', async () => {
+  vi.useFakeTimers()
+  try {
+    let stream!: ReadableStreamDefaultController<Uint8Array>
+    const request = vi.fn<typeof fetch>(async () => new Response(new ReadableStream({ start(controller) { stream = controller } }), { headers: { 'content-type': 'text/event-stream' } }))
+    const result = new GroupDecisionService(request).decide({ ...settings, model: 'ordinary' }, { ...provider, apiBase: 'https://fixture.test/v1' }, group, context, signal)
+    const encoder = new TextEncoder()
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(30_000)
+      stream.enqueue(encoder.encode('data: {"choices":[{"delta":{"reasoning_content":"working"}}]}\n\n'))
+    }
+    stream.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: JSON.stringify({ mode: 'single', memberIds: ['eng'], leaderMemberId: 'lead', triggerMessageIds: ['user'], waitForHuman: false }) }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`))
+    stream.close()
+    await expect(result).resolves.toMatchObject({ memberIds: ['eng'] })
+    expect(request).toHaveBeenCalledOnce()
+  } finally { vi.useRealTimers() }
+})
+
+it('requests JSON output for compact DeepSeek completion review too', async () => {
+  const request = vi.fn<typeof fetch>(async (_input, init) => {
+    const body = JSON.parse(init!.body as string)
+    expect(body.response_format).toEqual({ type: 'json_object' })
+    return response({ choices: [{ message: { content: '{"status":"complete"}' } }] })
+  })
+  const completed = { ...context, completedTurns: [{ round: 1, memberId: 'eng', messageIds: [], privateMessageIds: [], triggerMessageIds: ['user'] }] }
+  await expect(new GroupDecisionService(request).plan({ ...provider, apiBase: 'https://api.deepseek.com' }, 'deepseek-flash', group, completed, signal, group.members[0], true)).resolves.toMatchObject({ mode: 'none' })
+  expect(request).toHaveBeenCalledOnce()
+})

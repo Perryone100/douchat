@@ -1,3 +1,5 @@
+import { DecisionTransportError, readDecisionResponse } from './decisionStream'
+import { firstGroupPlan, GROUP_PLANNING_BUDGET_MS } from './groupPlanning'
 import { completionReviewPrompt, completionReviewDecision, participationDecision, participationPrompt } from '../shared/bot/groupParticipation'
 import { groupTaskEvidence } from '../shared/bot/groupTasks'
 import { customEndpoint } from '../shared/customModels'
@@ -12,9 +14,6 @@ export interface DecisionProvider extends CustomProviderRecord {
 
 export class DecisionEscalation extends Error {
   constructor(message: string, readonly leaderMemberId?: string, readonly routeHint?: string) { super(message) }
-}
-class DecisionTransportError extends Error {
-  constructor(readonly status: number) { super(`Decision service request failed (HTTP ${status}).`) }
 }
 
 /** Decision-only transport: no tools, conversation state, or keys in renderer output. */
@@ -45,17 +44,16 @@ export class GroupDecisionService {
     const fingerprint = JSON.stringify([settings, provider.id, provider.apiBase, provider.apiKey])
     if (fingerprint !== this.fingerprint) { this.fingerprint = fingerprint; this.failures = 0; this.retryAt = 0 }
     if (Date.now() < this.retryAt) throw new Error('The decision service is temporarily unavailable. Using fallback coordination.')
-    const deadline = AbortSignal.any([signal, AbortSignal.timeout(40_000)])
     try {
       const decision = (provider.cloud?.protocol ?? decisionProtocol(settings.model)) === 'jev'
-        ? await this.jev(settings, provider, group, context, deadline)
-        : await this.plan(provider, settings.model, group, context, deadline)
+        ? await this.jev(settings, provider, group, context, signal)
+        : await firstGroupPlan([{ run: (attemptSignal, progress) => this.plan(provider, settings.model, group, context, attemptSignal, undefined, false, progress) }], signal)
       this.failures = 0
       return decision
     } catch (error) {
       if (!signal.aborted && !(error instanceof DecisionEscalation)) {
         this.failures++
-        if (error instanceof DecisionTransportError && [401, 403].includes(error.status)) this.retryAt = Date.now() + 300_000
+        if (error instanceof DecisionTransportError && [401, 403].includes(error.status ?? 0)) this.retryAt = Date.now() + 300_000
         else if (this.failures >= 3) this.retryAt = Date.now() + 60_000
       }
       throw error
@@ -63,16 +61,18 @@ export class GroupDecisionService {
   }
 
   async plan(provider: DecisionProvider, model: string, group: BotGroup, context: GroupDecisionContext, signal: AbortSignal,
-    coordinator = group.members.find(member => member.id === group.leadMemberId) ?? group.members[0], lightweight = false): Promise<GroupDecision> {
-    if (context.recovery) return this.recover(provider, model, group, context, signal)
+    coordinator = group.members.find(member => member.id === group.leadMemberId) ?? group.members[0], lightweight = false, onProgress?: () => void): Promise<GroupDecision> {
+    if (context.recovery) return this.recover(provider, model, group, context, signal, onProgress)
     if (lightweight && !groupConversationContinuity(group, context)) {
       try {
-        const raw = decisionJson(await this.complete(provider, model, (context.completedTurns.length ? completionReviewPrompt(group, context) : participationPrompt(group, context, coordinator)), signal)) as GroupDecision & { participation?: boolean }
+        const reviewSchema = context.completedTurns.length ? { type: 'object', additionalProperties: false,
+          properties: { status: { type: 'string', enum: ['complete', 'waiting', 'continue'] } }, required: ['status'] } : undefined
+        const raw = decisionJson(await this.complete(provider, model, (context.completedTurns.length ? completionReviewPrompt(group, context) : participationPrompt(group, context, coordinator)), signal, reviewSchema, onProgress)) as GroupDecision & { participation?: boolean }
         const simple = raw && raw.participation === undefined && raw.mode
           ? validateGroupDecision({ ...raw, leaderMemberId: raw.leaderMemberId ?? coordinator.id }, group, context)
           : context.completedTurns.length ? completionReviewDecision(raw, group, context) : participationDecision(raw, group, context, coordinator.id)
         if (simple) return simple
-      } catch (error) { if (signal.aborted) throw error }
+      } catch (error) { if (signal.aborted || error instanceof DecisionTransportError) throw error }
     }
     let correction = ''
     const ids = group.members.map(member => member.id)
@@ -95,7 +95,7 @@ export class GroupDecisionService {
     }, required: ['continueConversation', 'tasks', 'mode', 'memberIds', 'publicDeliverables', 'triggerMessageIds', 'waitForHuman', 'leaderFirst', 'supervise', 'requireSummary', 'participationOnly', 'participantScope', 'leaderMemberId', 'addressedMemberId', 'assignments'] }
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const raw = decisionJson(await this.complete(provider, model, `${groupDecisionPrompt(group, context, coordinator)}\nIf the response schema requires unused optional fields, use false for flags and null for an unused addressee or member assignment.${correction}`, signal, schema)) as Record<string, unknown>
+        const raw = decisionJson(await this.complete(provider, model, `${groupDecisionPrompt(group, context, coordinator)}\nIf the response schema requires unused optional fields, use false for flags and null for an unused addressee or member assignment.${correction}`, signal, schema, onProgress)) as Record<string, unknown>
         if (raw?.assignments && typeof raw.assignments === 'object' && !Array.isArray(raw.assignments)) raw.assignments = Object.fromEntries(Object.entries(raw.assignments).filter(([, value]) => value !== null && !(typeof value === 'string' && !value.trim())))
         if (typeof raw?.waitForHuman !== 'boolean') throw new Error('Include the required waitForHuman boolean. A clarification or approval question requires true.')
         const decision = validateGroupDecision(raw, group, context)
@@ -105,20 +105,20 @@ export class GroupDecisionService {
             'Check whether this latest message needs an agent response NOW. Return only {"needsReply":true} or {"needsReply":false}. Do not perform the task.',
             'True for an unanswered request to an agent, advice/discussion, or a required clarification. “Only discuss”, “do not operate external systems” and “stop after completing” still require a reply. False for a message only for humans, an explicit instruction for agents to stay silent, or information requiring no response. No agent has replied to the latest message yet.',
             JSON.stringify({ latest: context.messages.at(-1) ? { ...context.messages.at(-1), content: context.messages.at(-1)!.content.slice(0, 12_000) } : undefined, members: group.members, recent: context.messages.slice(-6).map(message => ({ ...message, content: message.content.slice(0, 2000) })) })
-          ].join('\n'), signal, { type: 'object', additionalProperties: false, properties: { needsReply: { type: 'boolean' } }, required: ['needsReply'] })) as { needsReply?: boolean }
+          ].join('\n'), signal, { type: 'object', additionalProperties: false, properties: { needsReply: { type: 'boolean' } }, required: ['needsReply'] }, onProgress)) as { needsReply?: boolean }
           if (typeof audit.needsReply !== 'boolean') throw new Error('The no-reply decision could not be verified.')
           if (audit.needsReply) throw new Error('This latest message still requires an agent response. Return an active plan, or a single clarification reply with waitForHuman=true.')
         }
         return decision
       } catch (error) {
-        if (attempt || signal.aborted) throw error
+        if (attempt || signal.aborted || error instanceof DecisionTransportError) throw error
         correction = `\nCorrect the previous decision schema: ${error instanceof Error ? error.message : 'Invalid decision'}. Return only minified valid JSON, using exact IDs from the roster. Do not repeat any completed work.`
       }
     }
     throw new Error('Invalid decision format.')
   }
 
-  private async recover(provider: DecisionProvider, model: string, group: BotGroup, context: GroupDecisionContext, signal: AbortSignal): Promise<GroupDecision> {
+  private async recover(provider: DecisionProvider, model: string, group: BotGroup, context: GroupDecisionContext, signal: AbortSignal, onProgress?: () => void): Promise<GroupDecision> {
     const recovery = context.recovery!
     const available = group.members.filter(member => !context.unavailableMemberIds?.includes(member.id))
     const actions = recovery.participationOnly ? ['skip', 'pause'] : ['replace', 'pause']
@@ -135,35 +135,39 @@ export class GroupDecisionService {
     let correction = ''
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const raw = decisionJson(await this.complete(provider, model, prompt + correction, signal, schema)) as Record<string, unknown>
+        const raw = decisionJson(await this.complete(provider, model, prompt + correction, signal, schema, onProgress)) as Record<string, unknown>
         if (available.length && typeof raw.leaderMemberId !== 'string') throw new Error('Choose an available leaderMemberId')
         return validateGroupDecision({ leaderMemberId: raw.leaderMemberId, recoveryAction: raw.recoveryAction,
           mode: raw.recoveryAction === 'replace' ? 'single' : 'none', memberIds: raw.recoveryAction === 'replace' ? [raw.replacementMemberId] : [],
           triggerMessageIds: raw.recoveryAction === 'replace' ? recovery.triggerMessageIds : [] }, group, context)
       } catch (error) {
-        if (attempt || signal.aborted) throw error
+        if (attempt || signal.aborted || error instanceof DecisionTransportError) throw error
         correction = `\nCorrect this schema error: ${error instanceof Error ? error.message : 'Invalid recovery'}. Return only the three requested fields.`
       }
     }
     throw new Error('Invalid recovery decision')
   }
 
-  async complete(provider: DecisionProvider, model: string, prompt: string, signal: AbortSignal, schema?: object): Promise<string> {
+  async complete(provider: DecisionProvider, model: string, prompt: string, signal: AbortSignal, schema?: object, onProgress?: () => void): Promise<string> {
     const reasoning = new URL(provider.apiBase).hostname === 'openrouter.ai' ? await this.openRouterReasoning(model, signal) : undefined
     const structured = schema && reasoning && this.structuredModels.has(model) && provider.kind === 'openai'
     const body = {
-      model, max_tokens: 8192,
+      model, max_tokens: 8192, stream: true,
+      // Planning is an independent, tool-free workload. Do not silently inherit
+      // a provider's high reasoning default or a worker persona's settings.
+      ...(provider.kind === 'openai' && new URL(provider.apiBase).hostname === 'api.deepseek.com'
+        ? { thinking: { type: 'enabled' }, reasoning_effort: 'low', ...(schema ? { response_format: { type: 'json_object' } } : {}) } : {}),
       ...(reasoning ? { reasoning } : {}),
       ...(structured ? { response_format: { type: 'json_schema', json_schema: { name: 'group_decision', strict: true, schema } }, provider: { require_parameters: true } } : {}),
       messages: [{ role: 'user', content: prompt }]
     }
     let data: any
-    try { data = await this.post(customEndpoint(provider.apiBase, provider.kind), provider, body, signal, 60_000) }
+    try { data = await this.post(customEndpoint(provider.apiBase, provider.kind), provider, body, signal, GROUP_PLANNING_BUDGET_MS, onProgress) }
     catch (error) {
       if (!structured || !/HTTP (400|404)/.test(error instanceof Error ? error.message : '')) throw error
       this.structuredModels.delete(model)
       const { response_format: _format, provider: _routing, ...fallback } = body
-      data = await this.post(customEndpoint(provider.apiBase, provider.kind), provider, fallback, signal, 60_000)
+      data = await this.post(customEndpoint(provider.apiBase, provider.kind), provider, fallback, signal, GROUP_PLANNING_BUDGET_MS, onProgress)
     }
     const text = provider.kind === 'anthropic'
       ? data.content?.filter((part: { type: string }) => part.type === 'text').map((part: { text: string }) => part.text).join('\n')
@@ -288,13 +292,17 @@ export class GroupDecisionService {
     return validateGroupDecision({ leaderMemberId, mode: route.choice, memberIds: selected.map(member => member.id), triggerMessageIds: [latest.id] }, group, context)
   }
 
-  private async post(url: string, provider: DecisionProvider, body: unknown, signal: AbortSignal, timeout: number): Promise<any> {
+  private async post(url: string, provider: DecisionProvider, body: unknown, signal: AbortSignal, timeout: number, onProgress?: () => void): Promise<any> {
+    const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(timeout)])
     const response = await this.request(provider.cloud?.endpoint ?? url, {
-      method: 'POST', redirect: 'error', signal: AbortSignal.any([signal, AbortSignal.timeout(timeout)]),
+      method: 'POST', redirect: 'error', signal: requestSignal,
       headers: provider.cloud ? { 'Content-Type': 'application/json', Authorization: `Bearer ${provider.apiKey}`, 'Idempotency-Key': randomUUID() } : provider.kind === 'anthropic'
         ? { 'Content-Type': 'application/json', 'x-api-key': provider.apiKey, 'anthropic-version': '2023-06-01' }
         : { 'Content-Type': 'application/json', Authorization: `Bearer ${provider.apiKey}` },
       body: JSON.stringify(body)
+    }).catch(() => {
+      requestSignal.throwIfAborted()
+      throw new DecisionTransportError('The planning service could not be reached.')
     })
     if (provider.cloud) {
       if (response.status === 401) await provider.cloud.onUnauthorized?.()
@@ -302,7 +310,11 @@ export class GroupDecisionService {
       if (!response.ok || result?.code !== 0) throw new Error(result?.message || `Cloud decision service unavailable (HTTP ${response.status}).`)
       return result.data
     }
-    if (!response.ok) throw new DecisionTransportError(response.status)
-    return response.json()
+    if (!response.ok) throw new DecisionTransportError(`Decision service request failed (HTTP ${response.status}).`, response.status)
+    return readDecisionResponse(response, provider.kind, requestSignal, onProgress).catch(error => {
+      requestSignal.throwIfAborted()
+      if (error instanceof DecisionTransportError) throw error
+      throw new DecisionTransportError('The planning service response was interrupted or invalid.')
+    })
   }
 }

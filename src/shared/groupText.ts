@@ -36,6 +36,7 @@ export const groupTranslations: Record<string, string> = {
   "The model returned no usable decision content (output limit reached).": "决策模型没有返回有效内容（输出预算耗尽）。",
   "The model returned no usable decision content (upstream reasoning failed).": "决策模型没有返回有效内容（上游推理失败）。",
 
+  "This coordinator produced no planning output for {seconds} seconds.": "该协调成员连续 {seconds} 秒没有产生规划输出。",
   "Group decision service": "群决策服务",
   "Choose who decides whether group messages need a reply and which members handle them. Members still use their own models to do the work.": "选择谁来判断群消息是否需要回复、由哪些成员处理。成员仍使用各自的模型完成任务。",
   "Decision mode": "决策方式",

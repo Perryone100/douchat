@@ -19,7 +19,7 @@ import { agentIdentityPrompt, agentPersona, validateAgentFiles, withoutSkillFile
 import { groupMemoryPrompt, userMemoryPrompt, localUserMemoryEdits, MEMORY_OPEN, MEMORY_CLOSE, type UserMemoryEdit } from '../shared/userMemory'
 import { groupNotice, groupText } from '../shared/groupText'
 import { CUSTOM_PROVIDER_PREFIX } from '../shared/customModels'
-import { cancellableGroupPlan, firstGroupPlan, planningFailureReason, GROUP_PLANNING_ATTEMPT_MS, GROUP_PLANNING_BUDGET_MS } from './groupPlanning'
+import { cancellableGroupPlan, firstGroupPlan, planningFailureReason, GROUP_PLANNING_BUDGET_MS } from './groupPlanning'
 import { DecisionEscalation, GroupDecisionService } from './groupDecision'
 import { rankGroupMembers, refreshGroupHealth, type GroupHealth } from './groupHealth'
 import { GroupGames } from './groupGames'
@@ -1029,9 +1029,9 @@ export class DouchatRuntime {
 
     agent.subscribe((event) => {
       if (this.sessions.get(sessionKey)?.agent !== agent) return
+      if (event.type === 'message_update' || event.type === 'tool_execution_start' || event.type === 'tool_execution_end') this.replyProgress.get(sessionKey)?.()
       const runId = this.activeRun.get(sessionKey)
       if (!runId) return
-      if (event.type === 'message_update' || event.type === 'tool_execution_start' || event.type === 'tool_execution_end') this.replyProgress.get(sessionKey)?.()
       if (event.type === 'tool_execution_start') {
         const key = `${runId}:${config.id}`
         const actions = this.toolActions.get(key) ?? new Map<string, MessageAction>()
@@ -2577,7 +2577,7 @@ export class DouchatRuntime {
                 } : undefined,
             onProgress: (localProgress) => {
               if (abort.signal.aborted) return
-              if (localProgress.silentSeconds < 2) onProgress?.()
+              if (localProgress.phase === 'working' && localProgress.silentSeconds < 2) onProgress?.()
               if (localProgress.detail?.includes('[[douchat_')) localProgress = { ...localProgress, detail: undefined }
               this.setActivity(conversationId, topicId, 'replying', [config.id], config.name, { localProgress, action: undefined }, config.id)
               if (runId) this.store.updateRun(runId, { latestActivity: localProgress.detail || localProgress.phase })
@@ -3607,7 +3607,10 @@ export class DouchatRuntime {
           phase: context.recovery ? 'recovery' : context.completedTurns.length ? 'continuation' : 'initial'
         }) })
         let electedByModel: string | undefined
-        let participationHint = settings.mode === 'leader' && !context.recovery && !groupConversationContinuity(group, context)
+        // Initial routing and dependency planning are one decision. A preliminary
+        // attendance classifier adds a round trip and can misclassify deliverables.
+        // Keep compact completion review and explicit Jev attendance escalation.
+        let participationHint = settings.mode === 'leader' && context.completedTurns.length > 0 && !context.recovery && !groupConversationContinuity(group, context)
         if (settings.mode !== 'leader') {
           const provider = this.decisionProviders.find(provider => provider.id === settings.providerId)
           this.setActivity(conversation.id, topicId, 'planning', [], 'Decision service', {
@@ -3633,7 +3636,19 @@ export class DouchatRuntime {
         return await firstGroupPlan(candidates.map((candidate, index) => {
           const config = this.store.agent(candidate.id)
           const controllerProvider = this.decisionProviders.find(provider => `custom:${provider.id}` === config?.provider)
-          return { run: async (planningSignal: AbortSignal) => {
+          // Only collapse requests known to use the same hosted credentials/model.
+          // Local agents may have different profiles, environments or remote hosts.
+          return { backendKey: controllerProvider && !config?.localAgentId ? `${controllerProvider.id}/${config?.model}` : undefined,
+            run: async (planningSignal: AbortSignal, planningProgress: () => void) => {
+            const requestedAt = Date.now()
+            let firstProgressMs: number | undefined
+            const progress = () => {
+              planningProgress()
+              if (firstProgressMs !== undefined || planningSignal.aborted) return
+              firstProgressMs = Date.now() - requestedAt
+              this.store.addRunEvent({ runId, type: 'status', label: 'Planning response started',
+                detail: JSON.stringify({ memberId: candidate.id, firstProgressMs }) })
+            }
             planning.clear()
             planning.add(candidate.id)
             this.setActivity(conversation.id, topicId, 'planning', [...planning], 'Coordinating the group', {
@@ -3650,9 +3665,9 @@ export class DouchatRuntime {
                 if (participationHint && !(controllerProvider && !config.localAgentId)) {
                   const prompt = context.completedTurns.length ? completionReviewPrompt(group, candidateContext) : participationPrompt(group, candidateContext, candidate)
                   const text = controllerProvider && !config.localAgentId
-                    ? await this.groupDecisionService.complete(controllerProvider, config.model, prompt, planningSignal)
+                    ? await this.groupDecisionService.complete(controllerProvider, config.model, prompt, planningSignal, undefined, progress)
                     : (await this.runReply({ config, sessionKey: controllerSessionKey, context: 'controller',
-                      timeoutMs: GROUP_PLANNING_ATTEMPT_MS, toolsDisabled: true, prompt,
+                      timeoutMs: GROUP_PLANNING_BUDGET_MS, onProgress: progress, toolsDisabled: true, prompt,
                       conversationId: conversation.id, topicId, signal: planningSignal })).text
                   planningSignal.throwIfAborted()
                   try {
@@ -3669,14 +3684,14 @@ export class DouchatRuntime {
                   this.disposeSession(controllerSessionKey)
                   participationHint = false
                 }
-                if (controllerProvider && !config.localAgentId) return this.groupDecisionService.plan(controllerProvider, config.model, group, candidateContext, planningSignal, candidate, participationHint)
+                if (controllerProvider && !config.localAgentId) return this.groupDecisionService.plan(controllerProvider, config.model, group, candidateContext, planningSignal, candidate, participationHint, progress)
                 let correction = ''
                 for (let attempt = 0; attempt < 2; attempt++) {
                   planningSignal.throwIfAborted()
                   // Planning already includes its required context. Reusing the
                   // model session would append old plans and duplicate transcripts.
                   this.disposeSession(controllerSessionKey)
-                  const reply = await this.runReply({ config, sessionKey: controllerSessionKey, context: 'controller', timeoutMs: GROUP_PLANNING_ATTEMPT_MS,
+                  const reply = await this.runReply({ config, sessionKey: controllerSessionKey, context: 'controller', timeoutMs: GROUP_PLANNING_BUDGET_MS, onProgress: progress,
                     toolsDisabled: true, prompt: groupDecisionPrompt(group, candidateContext, candidate) + correction,
                     conversationId: conversation.id, topicId, signal: planningSignal, images })
                   this.disposeSession(controllerSessionKey)
