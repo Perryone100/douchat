@@ -1419,12 +1419,17 @@ describe('DouchatRuntime', () => {
       if (!state.messages.length) state.messages.push(
         { role: 'user', content: 'Make a PPT' },
         { role: 'toolResult', toolCallId: 'read-1', content: [{ type: 'text', text: 'Template loaded' }] })
-      state.messages.push({ role: 'assistant', stopReason: 'stop', content: prompt.mock.calls.length > 1 && recovers ? [{ type: 'text', text: 'Result' }] : [] })
+      state.messages.push({ role: 'assistant', stopReason: 'stop', content: [] })
     })
-    internal.sessions.set('empty-recovery', { agentId: 'dobi', agent: { state, prompt, abort: vi.fn() } })
+    const resume = vi.fn(async () => {
+      expect(state.messages.at(-1).role).toBe('toolResult')
+      state.messages.push({ role: 'assistant', stopReason: 'stop', content: recovers ? [{ type: 'text', text: 'Result' }] : [] })
+    })
+    internal.sessions.set('empty-recovery', { agentId: 'dobi', agent: { state, prompt, continue: resume, abort: vi.fn() } })
     const reply = await internal.runReply({ config: store.agent('dobi'), sessionKey: 'empty-recovery', context: 'direct',
       prompt: 'Make a PPT', conversationId: 'direct-dobi', topicId: store.activeTopicId('direct-dobi') })
-    expect(prompt).toHaveBeenCalledTimes(2)
+    expect(prompt).toHaveBeenCalledTimes(1)
+    expect(resume).toHaveBeenCalledTimes(1)
     expect(state.messages.filter(message => message.role === 'toolResult')).toHaveLength(1)
     if (recovers) expect(reply).toMatchObject({ text: 'Result', retryCount: 1 })
     else expect(reply.error).toContain('finished without a text response')

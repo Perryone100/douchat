@@ -259,6 +259,37 @@ it('applies the configured reasoning policy to streamed group replies while pres
   expect(policy).toHaveBeenCalledWith('fixture', signal)
 })
 
+it('bounds the context at the real hosted stream boundary without changing the session transcript', () => {
+  const { runtime, internal, agents, group } = fixture()
+  runtime.configureCustomModels([{ id: 'fixture', name: 'Fixture', kind: 'openai', apiBase: 'https://fixture.invalid/v1', apiKey: 'fixture', models: ['fixture'] }])
+  const transport = vi.spyOn(internal.models, 'streamSimple').mockReturnValue({})
+  const agent = internal.session({ ...agents[0], provider: 'custom:fixture', model: 'fixture' }, `group:${group.id}:context`, 'group')
+  const messages = [{ role: 'user', content: '历史资料'.repeat(40000), timestamp: 1 },
+    { role: 'assistant', content: [{ type: 'text', text: 'Prior result' }], usage: { totalTokens: 136747 }, stopReason: 'stop', timestamp: 2 },
+    { role: 'user', content: '当前问题与必要的项目背景', timestamp: 3 }]
+  agent.streamFunction(agent.state.model, { messages, systemPrompt: 'Existing permissions and identity' }, {})
+  const sent = transport.mock.calls[0][1] as any
+  expect(sent.messages).toEqual([messages[2]])
+  expect(sent.systemPrompt).toContain('Existing permissions and identity')
+  expect(messages).toHaveLength(3)
+})
+
+it('names a new-message context failure and recovers without exposing provider details', async () => {
+  const { runtime, store, agents, group, internal } = fixture()
+  internal.runReply = async ({ config, context, prompt }: any) => {
+    if (context === 'controller') return scriptedPolicy(prompt, agents)
+    return config.id === agents[1].id
+      ? { text: '', error: 'maximum context length exceeded: PRIVATE_PROVIDER_BODY' }
+      : { text: '接替完成这条新消息。' }
+  }
+  await runtime.sendMessage(group.id, '@产品 需要我决定什么？')
+  const notices = store.topicMessages(group.id, group.activeTopicId).filter(message => message.kind === 'system').map(message => message.text).join('\n')
+  expect(notices).toContain('未能回答这条新消息')
+  expect(notices).toContain('对话上下文过长')
+  expect(notices).not.toContain('PRIVATE_PROVIDER_BODY')
+  expect(store.groupWorkflows()[0].status).toBe('completed')
+})
+
 it('repairs a private-only public assignment from public context before downstream work starts', async () => {
   const { runtime, store, agents, group, internal } = fixture()
   store.updateAgent(agents[1].id, { provider: 'custom:test', model: 'fixture' })

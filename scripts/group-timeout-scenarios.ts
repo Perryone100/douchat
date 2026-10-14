@@ -34,6 +34,43 @@ async function main() {
   const record = (result: Record<string, unknown>) => {
     report.push(result); writeFileSync(join(output, 'report.json'), JSON.stringify(report, null, 2)); console.log(JSON.stringify(result))
   }
+  if (process.argv.includes('--context-only')) {
+    const store = new DouchatStore(join(output, 'synthetic.db'))
+    store.setCurrentAccountId('synthetic-context-qa')
+    const computer: ComputerProvider = { snapshots: () => [], createTools: () => [], start: async () => { throw new Error('Disabled for QA') }, stop: async () => {}, show: async () => {}, dispose: () => {} }
+    const runtime = new DouchatRuntime(store, computer, () => {})
+    runtime.configureCustomModels([provider])
+    const agent = store.createAgent({ name: 'Context QA', role: 'Text-only verifier', instructions: 'Answer only the current request. Do not call tools.', color: '#6366f1', provider: `custom:${provider.id}`, model, thinkingLevel: 'low' })
+    const conversation = store.ensureDirectConversation(agent.id).conversation
+    const sessionKey = `direct:${conversation.id}:context-qa`
+    const internal = runtime as any
+    let requests = 0
+    const stream = internal.models.streamSimple.bind(internal.models)
+    internal.models.streamSimple = (...args: unknown[]) => { requests++; return stream(...args) }
+    const session = internal.session(agent, sessionKey, 'direct', true)
+    // Reproduce accumulated history and usage without sending private content
+    // or paying to generate an oversized transcript.
+    session.state.messages = [
+      { role: 'user', content: '旧的合成测试上下文。'.repeat(20000), timestamp: 1 },
+      { role: 'assistant', api: 'openai-completions', provider: agent.provider, model, timestamp: 2,
+        content: [{ type: 'text', text: 'Earlier synthetic work completed.' }], stopReason: 'stop',
+        usage: { input: 131882, output: 1, cacheRead: 4864, cacheWrite: 0, totalTokens: 136747, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } }
+    ]
+    const run = store.createRun({ agentId: agent.id, conversationId: conversation.id, title: 'Context budget QA', prompt: 'Return CONTEXT_OK', trigger: 'chat' })
+    const start = Date.now()
+    const reply = await internal.runReply({ config: agent, sessionKey, context: 'direct', prompt: '这是独立测试。本次只回复 CONTEXT_OK，不做其他操作。',
+      conversationId: conversation.id, topicId: conversation.activeTopicId, runId: run.id, toolsDisabled: true, timeoutMs: 60000 })
+    const trims = store.runEvents.filter(event => event.runId === run.id && event.label === 'Model context trimmed')
+    const passed = !reply.error && reply.text.includes('CONTEXT_OK') && trims.length > 0
+    const usage = session.state.messages.at(-1)?.usage
+    record({ scenario: 'long-context-reply', passed, elapsedMs: Date.now() - start, requests, text: reply.text, error: reply.error,
+      tokens: usage ? { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, reasoning: usage.reasoning } : undefined,
+      trims: trims.map(event => event.detail) })
+    store.close()
+    console.log(`REPORT ${output}`)
+    app.exit(passed ? 0 : 1)
+    return
+  }
   const group = { id: 'qa', name: 'Synthetic project', leadMemberId: 'pm', members: [
     { id: 'pm', name: '项目经理', description: '分工、协调、总结' },
     { id: 'product', name: '产品专家', description: '需求分析、文档' },

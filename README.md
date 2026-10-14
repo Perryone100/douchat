@@ -42,8 +42,9 @@
 - 传输失败与计划格式错误分别处理，避免对同一个已失败的模型后端反复换人重试。
 - 默认成员协调一次生成完整分工，减少开始工作前的串行模型调用。
 - 保留已有的任务依赖执行、步骤持久化、取消和权限确认，并补充可复现的测试。
+- 为长对话预留回答空间，避免历史累积后输出额度被压至 1 token；区分上下文、输出上限与超时提示，详见 [上下文预算与成本](docs/model-context-budget.md)。
 
-已完成本地自动测试 **1,392 项通过、4 项跳过**，以及 DeepSeek 五任务依赖流程、
+已完成本地自动测试 **1,406 项通过、4 项跳过**，以及 DeepSeek 五任务依赖流程、
 DeepSeek + 本地 Codex 三阶段交接的实测。实测耗时、测试边界、配置与故障定位见
 [中文说明](docs/fork-overview.zh-CN.md)，实现细节见
 [规划可靠性文档](https://github.com/Perryone100/douchat/blob/codex/fix-planning-timeouts/docs/group-planning-reliability.md)。

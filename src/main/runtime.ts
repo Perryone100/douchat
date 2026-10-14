@@ -46,6 +46,7 @@ import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { basename, join, dirname, isAbsolute } from 'node:path'
 import { Agent, type AgentTool } from '@earendil-works/pi-agent-core'
+import { boundModelContext, memberFailureReason } from './modelContext'
 import { DEFAULT_CLOUD_THINKING_LEVEL } from '../shared/thinkingLevels'
 import { Type, type ImageContent } from '@earendil-works/pi-ai'
 import { builtinModels } from '@earendil-works/pi-ai/providers/all'
@@ -1011,12 +1012,16 @@ export class DouchatRuntime {
         tools: guardedTools
       },
       streamFn: (selectedModel, streamContext, options) => {
+        const bounded = boundModelContext(streamContext, selectedModel)
+        const runId = this.activeRun.get(sessionKey)
+        if (bounded.removedMessages && runId) this.store.addRunEvent({ runId, type: 'status', label: 'Model context trimmed',
+          detail: JSON.stringify({ memberId: config.id, removedMessages: bounded.removedMessages, estimatedTokens: bounded.estimatedTokens, inputBudget: bounded.budget }) })
         // Group turns cap OpenRouter reasoning unless a custom model's user chose a depth explicitly.
         // An explicit 'off' still goes through the catalog so mandatory reasoning models keep working.
         const boundedOpenRouterTurn = context === 'group' && selectedModel.api === 'openai-completions'
           && new URL(selectedModel.baseUrl).hostname === 'openrouter.ai'
           && (!agentThinking || agentThinking === 'off')
-        return this.models.streamSimple(selectedModel, streamContext, boundedOpenRouterTurn ? {
+        return this.models.streamSimple(selectedModel, bounded.context, boundedOpenRouterTurn ? {
           ...options,
           onPayload: async (payload, model) => {
             const transformed = await options?.onPayload?.(payload, model)
@@ -2775,7 +2780,10 @@ export class DouchatRuntime {
           if (runId) this.store.addRunEvent({ runId, type: 'status', label: `${config.name} · empty response recovery`,
             detail: JSON.stringify({ stopReason: final.stopReason, usage: final.usage }) })
           retryCount += 1
-          await requestResponse(() => session.prompt('Your last response ended without any user-visible output. Continue from the existing tool results without repeating completed actions. Finish the requested task and return its result, or explain the concrete blocker.'))
+          // Resume the same user/tool turn. Appending another user prompt would
+          // grow the context and separate completed tools from their request.
+          session.state.messages = session.state.messages.slice(0, -1)
+          await requestResponse(() => session.continue())
         }
       } finally {
         signal?.removeEventListener('abort', abort)
@@ -2784,6 +2792,8 @@ export class DouchatRuntime {
       const lastMessage = [...session.state.messages].reverse().find((message) => message.role === 'assistant')
       const text = lastMessage && 'content' in lastMessage ? this.readText(lastMessage.content) : ''
       const error = lastMessage && 'errorMessage' in lastMessage ? (lastMessage.errorMessage as string) : undefined
+      if (lastMessage?.role === 'assistant' && lastMessage.stopReason === 'length') return finish({ text,
+        error: `${config.name}: model output limit reached before a complete response.`, ...(retryCount ? { retryCount } : {}) })
       if (!text.trim() && error) return finish({ text: '', error, ...(retryCount ? { retryCount } : {}) })
       return finish({
         text,
@@ -3578,6 +3588,7 @@ export class DouchatRuntime {
     this.store.saveGroupWorkflow(workflow)
 
     const unavailableMembers = new Set<string>(Object.keys(health).filter(id => health[id].status === 'unavailable'))
+    const memberFailures = new Map<string, string>()
     const failedControllers = new Set<string>()
     let participationPlan: GroupDecision | undefined
     let coordinator = groupLeadMember(group)
@@ -3803,7 +3814,9 @@ export class DouchatRuntime {
           throw new Error('A member returned an incomplete result after an execution error. Review the partial output before retrying; external actions will not be repeated automatically.')
         }
         if (!outcome.text.trim() && !outcome.attachments?.length && !outcome.actions?.length) {
-          this.store.addRunEvent({ runId, type: 'status', label: 'Member reply failed', detail: `${member.name}: ${outcome.error ? 'model response unavailable' : 'empty response'}` })
+          const reason = memberFailureReason(outcome.error)
+          memberFailures.set(member.id, reason)
+          this.store.addRunEvent({ runId, type: 'status', label: 'Member reply failed', detail: `${member.name}: ${reason}` })
           observe(member.id, false)
           const startupFailure = /queue.*before execution|no route-compatible authentication|not authenticated|authentication (?:required|failed)|api.?key.*(?:missing|invalid)|ENOENT|not installed|executable.*not found/i.test(outcome.error ?? '')
           if (config.localAgentId && outcome.error && !turn.participationOnly && !startupFailure) throw new Error(groupText(this.interfaceLanguage, '{member} was interrupted. Reason: {reason}\nExternal actions may have already run. Check the results before sending a new instruction; this task will not be repeated automatically.', { member: member.name, reason: outcome.error }))
@@ -3904,7 +3917,10 @@ export class DouchatRuntime {
         const id = `${workflow.id}:unavailable:${memberId}`
         if (!this.store.topicMessages(conversation.id, topicId).some(message => message.id === id)) this.store.addMessage({
           id, conversationId: conversation.id, topicId, authorId: 'system', authorName: 'Douchat', kind: 'system',
-          ...groupNotice(this.interfaceLanguage, cached ? 'Scheduling: {member} is not configured to run. Skipping this round.' : 'Scheduling: {member} did not complete this reply. Deciding what happens next.', { member: member?.name ?? memberId }) })
+          ...groupNotice(this.interfaceLanguage, cached ? 'Scheduling: {member} is not configured to run. Skipping this round.'
+            : memberFailures.has(memberId) ? 'Scheduling: {member} could not answer the current request: {reason}. Deciding what happens next.'
+              : 'Scheduling: {member} did not complete this reply. Deciding what happens next.',
+          { member: member?.name ?? memberId, reason: groupText(this.interfaceLanguage, memberFailures.get(memberId) ?? 'The model returned no usable reply') }) })
         this.emit()
       },
       decide: async context => {
