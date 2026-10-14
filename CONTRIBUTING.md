@@ -1,5 +1,11 @@
 # Contributing to Douchat
 
+This checkout is the [Perryone100 community fork](https://github.com/Perryone100/douchat).
+See the [fork guide](docs/fork-overview.zh-CN.md) for branch status, the timeout-fix
+branch and validation scope. Target this fork's `dev` for fork changes; submitting
+to the upstream repository is a separate step. The upstream contribution and
+license terms below are retained.
+
 Thanks for your interest in improving Douchat! This guide covers local setup and
 how to get a change merged.
 
@@ -7,17 +13,20 @@ how to get a change merged.
 
 - **Node.js 22.12+** and **npm 10+**
 - macOS: Xcode Command Line Tools
-- Optional: a Douchat account for Cloud Agents, or a supported local agent CLI
-  (Claude Code, Codex, Gemini, …) for Local Agents
+- A Douchat account to sign in to the desktop client
+- Optional: a supported local agent CLI (Claude Code, Codex, Gemini, …) for Local Agents
 
 ## Setup
 
 ```bash
-git clone git@github.com:thinkany-ai/douchat.git
+git clone https://github.com/Perryone100/douchat.git
 cd douchat
 npm ci
 cp .env.example .env
 ```
+
+This setup checks out `dev`. To try or extend the unmerged timeout fixes, switch
+to `codex/fix-planning-timeouts` before installing dependencies; see the fork guide.
 
 ## Running
 

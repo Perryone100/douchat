@@ -2,19 +2,56 @@
   <img src="resources/icons/douchat.png" width="128" alt="Douchat logo">
 </p>
 
-<h1 align="center">Douchat</h1>
+<h1 align="center">Douchat · Perryone100 Fork</h1>
 
 <p align="center">
-  A desktop workspace where AI agents work and talk together.
+  面向可靠多智能体协作的社区修改版 · Reliable multi-agent collaboration.
 </p>
 
 <p align="center">
-  <a href="https://douchat.ai">Website</a> ·
+  <a href="docs/fork-overview.zh-CN.md">中文使用与维护说明</a> ·
+  <a href="https://github.com/Perryone100/douchat/pull/1">超时修复 PR</a> ·
+  <a href="https://douchat.ai">Upstream website</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="docs">Docs</a> ·
   <a href="CONTRIBUTING.md">Contributing</a> ·
   <a href="LICENSE">License</a>
 </p>
+
+## 关于这个 Fork
+
+这是 [Perryone100/douchat](https://github.com/Perryone100/douchat)，基于
+[thinkany-ai/douchat](https://github.com/thinkany-ai/douchat) 的社区修改版。
+当前重点是解决**群任务反复规划超时、迟迟无法进入执行**的问题，让自有模型和本地智能体可以可靠地交接任务。
+原项目的桌面界面、联系人、记忆、工具和权限机制继续沿用；修复不绑定某套团队名称、岗位或项目类型。
+
+**分支状态（2026-10-14）**
+
+| 入口 | 内容 |
+| --- | --- |
+| [`dev`](https://github.com/Perryone100/douchat/tree/dev) | 默认分支：上游 v0.1.24 基线及本 Fork 的说明文档；尚未合入超时修复。 |
+| [`codex/fix-planning-timeouts`](https://github.com/Perryone100/douchat/tree/codex/fix-planning-timeouts) | 可从源码运行的修复版，包含流式规划、进度感知超时、失败切换及回归测试。 |
+| [PR #1](https://github.com/Perryone100/douchat/pull/1) | 修复代码和验证依据；当前为草稿 PR，是否合并以 PR 页面为准。 |
+
+**体验修复版请使用下方 Quick start 中指定的分支。** 本 Fork 暂未发布安装包；
+从上游官网下载的版本不包含这里尚未合并的改动。
+
+### 当前修复内容
+
+- 规划请求改为读取流式进度，区分模型仍在生成与请求真正停滞；保留无进度期限和总预算。
+- 传输失败与计划格式错误分别处理，避免对同一个已失败的模型后端反复换人重试。
+- 默认成员协调一次生成完整分工，减少开始工作前的串行模型调用。
+- 保留已有的任务依赖执行、步骤持久化、取消和权限确认，并补充可复现的测试。
+
+已完成本地自动测试 **1,392 项通过、4 项跳过**，以及 DeepSeek 五任务依赖流程、
+DeepSeek + 本地 Codex 三阶段交接的实测。实测耗时、测试边界、配置与故障定位见
+[中文说明](docs/fork-overview.zh-CN.md)，实现细节见
+[规划可靠性文档](https://github.com/Perryone100/douchat/blob/codex/fix-planning-timeouts/docs/group-planning-reliability.md)。
+
+本 Fork 仍需要 Douchat 账号登录。配置自有 API 或本地智能体，可以让相应模型调用使用自己的服务；
+这不等于移除了 Douchat 的账号、云端联系人或共享群服务。上游原有功能介绍如下。
+
+## Upstream project
 
 Douchat is an Electron desktop workspace where independent AI agents can work
 alone or collaborate in a shared conversation. You sign in with a
@@ -134,9 +171,11 @@ agents. Billing stays with your provider.
 
 ## Download
 
-Signed macOS builds for Apple Silicon and Intel are available from
-[douchat.ai](https://douchat.ai). Installed apps update themselves automatically.
-To build from source instead, follow the quick start below.
+This fork has no published installer or independent update channel yet. Use the
+source instructions below to try its fixes. Signed macOS builds from
+[douchat.ai](https://douchat.ai) are upstream releases and do not include this
+fork's unmerged changes. Packaging and update settings are still inherited from
+upstream; see the [fork guide](docs/fork-overview.zh-CN.md#安装包与更新).
 
 ## Requirements
 
@@ -148,12 +187,17 @@ To build from source instead, follow the quick start below.
 ## Quick start
 
 ```bash
-git clone https://github.com/thinkany-ai/douchat.git
+git clone --branch codex/fix-planning-timeouts https://github.com/Perryone100/douchat.git
 cd douchat
 npm ci
 cp .env.example .env
 npm run dev
 ```
+
+The branch above contains the timeout fixes. A plain clone without `--branch`
+currently checks out `dev`, which does not yet contain them. The instructions
+assume a fresh directory; see the [fork guide](docs/fork-overview.zh-CN.md#从源码启动修复版)
+before updating an existing checkout.
 
 Click **Get started** and sign in with a [douchat.ai](https://douchat.ai) account
 in your browser; the app returns automatically. Development builds use
