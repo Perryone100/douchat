@@ -253,25 +253,35 @@ it('applies the configured reasoning policy to streamed group replies while pres
   const agent = internal.session({ ...agents[0], provider: 'custom:openrouter', model: 'fixture' }, `group:${group.id}:fixture`, 'group')
   const original = { model: 'fixture', messages: [{ role: 'user', content: 'Work' }], tools: [{ name: 'authorized-tool' }] }
   const signal = new AbortController().signal
-  agent.streamFunction(agent.state.model, { messages: [] }, { signal, onPayload: (payload: object) => ({ ...payload, temperature: 0.2 }) })
+  await agent.streamFunction(agent.state.model, { messages: [] }, { signal, onPayload: (payload: object) => ({ ...payload, temperature: 0.2 }) })
   const output = await (transport.mock.calls[0][2] as any).onPayload(original, agent.state.model)
   expect(output).toEqual({ ...original, temperature: 0.2, reasoning: { enabled: false, exclude: true } })
   expect(policy).toHaveBeenCalledWith('fixture', signal)
 })
 
-it('bounds the context at the real hosted stream boundary without changing the session transcript', () => {
-  const { runtime, internal, agents, group } = fixture()
+it('compacts hosted requests with a saved handoff before the real stream boundary', async () => {
+  const { runtime, store, agents, group, internal } = fixture()
   runtime.configureCustomModels([{ id: 'fixture', name: 'Fixture', kind: 'openai', apiBase: 'https://fixture.invalid/v1', apiKey: 'fixture', models: ['fixture'] }])
-  const transport = vi.spyOn(internal.models, 'streamSimple').mockReturnValue({})
-  const agent = internal.session({ ...agents[0], provider: 'custom:fixture', model: 'fixture' }, `group:${group.id}:context`, 'group')
-  const messages = [{ role: 'user', content: '历史资料'.repeat(40000), timestamp: 1 },
+  const summary = { goalsAndConstraints: ['Old requirement retained'], decisions: [], completedWork: [], pendingWork: ['Current task'], references: [], uncertainties: [] }
+  const stream = { async *[Symbol.asyncIterator]() {}, result: async () => ({ stopReason: 'stop', content: [{ type: 'text', text: JSON.stringify(summary) }], usage: { input: 200, output: 100 } }) }
+  const transport = vi.spyOn(internal.models, 'streamSimple').mockReturnValue(stream)
+  const key = `group:${group.id}:context`
+  internal.activeConversation.set(key, group.id)
+  internal.activeTopic.set(key, group.activeTopicId)
+  const agent = internal.session({ ...agents[0], provider: 'custom:fixture', model: 'fixture' }, key, 'group')
+  const messages = [{ role: 'user', content: 'Old requirement retained', timestamp: 1 },
     { role: 'assistant', content: [{ type: 'text', text: 'Prior result' }], usage: { totalTokens: 136747 }, stopReason: 'stop', timestamp: 2 },
-    { role: 'user', content: '当前问题与必要的项目背景', timestamp: 3 }]
-  agent.streamFunction(agent.state.model, { messages, systemPrompt: 'Existing permissions and identity' }, {})
-  const sent = transport.mock.calls[0][1] as any
-  expect(sent.messages).toEqual([messages[2]])
-  expect(sent.systemPrompt).toContain('Existing permissions and identity')
+    { role: 'user', content: 'Current task', timestamp: 3 }]
+  await agent.streamFunction(agent.state.model, { messages, systemPrompt: 'Existing permissions and identity' }, {})
+  expect(transport).toHaveBeenCalledTimes(2)
+  expect((transport.mock.calls[0][0] as any).maxTokens).toBe(4096)
+  expect(transport.mock.calls[0][2]).toMatchObject({ maxTokens: 4096, maxRetries: 0, reasoning: 'minimal' })
+  const sent = transport.mock.calls[1][1] as any
+  expect(sent.messages.at(-1)).toEqual(messages[2])
+  expect(JSON.stringify(sent.messages[0])).toContain('Old requirement retained')
+  expect(sent.systemPrompt).toBe('Existing permissions and identity')
   expect(messages).toHaveLength(3)
+  expect(store.modelCheckpoint({ ownerId: store.currentAccountId, conversationId: group.id, topicId: group.activeTopicId, agentId: agents[0].id, sessionKey: key })?.messages).toEqual(messages.slice(0, 2))
 })
 
 it('names a new-message context failure and recovers without exposing provider details', async () => {

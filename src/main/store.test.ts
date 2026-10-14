@@ -31,6 +31,50 @@ it('isolates persisted group health by group and account', () => {
   store.close()
 })
 
+it('keeps checkpoint evidence across restart, isolates its scope and rejects evidence cleared by an older client', () => {
+  const store = createStore(), file = join(temporaryDirectories.at(-1)!, 'douchat.db')
+  const member = store.createAgent({ name: 'Checkpoint member', role: '', instructions: '', color: '', provider: 'test', model: 'test' })
+  const group = store.createGroup({ name: 'Checkpoint group', agentIds: [member.id, 'lin'] })
+  const scope = { ownerId: store.currentAccountId, conversationId: group.id, topicId: group.activeTopicId, agentId: member.id, sessionKey: 'group:checkpoint:member' }
+  const checkpoint = { id: 'cp-1', createdAt: 1, summary: { goalsAndConstraints: ['Keep requirement'], decisions: [], completedWork: [], pendingWork: [], references: [], uncertainties: [] },
+    messages: [{ role: 'user' as const, content: 'Private source evidence', timestamp: 1 }] }
+  const addEvidence = () => store.addMessage({ conversationId: group.id, topicId: group.activeTopicId, authorId: 'user', authorName: 'You', text: 'Evidence anchor', kind: 'message' })
+  addEvidence()
+  store.saveModelCheckpoint(scope, checkpoint)
+  expect(store.modelCheckpoint(scope)).toEqual(checkpoint)
+  expect(store.modelCheckpoint({ ...scope, sessionKey: 'another-session' }, checkpoint.id)).toBeUndefined()
+  expect(store.modelCheckpoint({ ...scope, agentId: 'lin' }, checkpoint.id)).toBeUndefined()
+  store.setCurrentAccountId('other-account')
+  expect(() => store.modelCheckpoint(scope)).toThrow('unavailable')
+  store.setCurrentAccountId(scope.ownerId)
+  store.close()
+  const reopened = new DouchatStore(file)
+  expect(reopened.modelCheckpoint(scope)).toEqual(checkpoint)
+  const database = new DatabaseSync(file)
+  const persistedData = () => (database.prepare('SELECT data FROM modelCheckpoints WHERE id = ?').get(checkpoint.id) as { data: string }).data
+  // Older clients do not delete the new table on reset/clear. Restore the row
+  // after those actions to reproduce that rollback/re-upgrade boundary.
+  const restoreLegacyRow = (data: string) => database.prepare('INSERT INTO modelCheckpoints (ownerId, sessionKey, id, conversationId, topicId, agentId, data) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(scope.ownerId, scope.sessionKey, checkpoint.id, scope.conversationId, scope.topicId, scope.agentId, data)
+  const beforeReset = persistedData()
+  reopened.resetConversationContext(scope.conversationId, scope.topicId)
+  expect(reopened.modelCheckpoint(scope)).toBeUndefined()
+  restoreLegacyRow(beforeReset)
+  expect(reopened.modelCheckpoint(scope)).toBeUndefined()
+  reopened.addMessage({ conversationId: group.id, topicId: group.activeTopicId, authorId: 'user', authorName: 'You', text: 'New evidence anchor', kind: 'message' })
+  reopened.saveModelCheckpoint(scope, checkpoint)
+  const beforeClear = persistedData()
+  reopened.clearConversation(scope.conversationId, scope.topicId)
+  expect(reopened.modelCheckpoint(scope)).toBeUndefined()
+  restoreLegacyRow(beforeClear)
+  expect(reopened.modelCheckpoint(scope)).toBeUndefined()
+  reopened.saveModelCheckpoint(scope, checkpoint)
+  reopened.deleteAgent(scope.agentId)
+  expect(() => reopened.modelCheckpoint(scope)).toThrow('unavailable')
+  database.close()
+  reopened.close()
+})
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true })

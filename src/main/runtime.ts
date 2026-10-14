@@ -46,7 +46,8 @@ import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { basename, join, dirname, isAbsolute } from 'node:path'
 import { Agent, type AgentTool } from '@earendil-works/pi-agent-core'
-import { boundModelContext, memberFailureReason } from './modelContext'
+import { ModelContextManager, ModelContextLimitError, estimateContext, memberFailureReason } from './modelContext'
+import type { ModelCheckpointScope } from './store'
 import { DEFAULT_CLOUD_THINKING_LEVEL } from '../shared/thinkingLevels'
 import { Type, type ImageContent } from '@earendil-works/pi-ai'
 import { builtinModels } from '@earendil-works/pi-ai/providers/all'
@@ -960,8 +961,8 @@ export class DouchatRuntime {
       context === 'controller' || toolsDisabled
         ? []
         : context === 'group'
-          ? [this.userMemoryTool(sessionKey), this.internalMemoryTool(sessionKey), ...routineTools, ...managementTools, ...this.skillTools(config.id), ...this.skillInstallationTools(config.id, sessionKey), ...this.artifactTools(config.id, sessionKey), ...this.computer.createTools(config.id, () => this.conversationFileRoots(config.id, sessionKey), (path, operation, signal) => this.requestConversationFolder(config.id, sessionKey, path, operation, signal)), ...this.connectors.createTools(config.id, this.connectorHooks(config.id, sessionKey))]
-          : [this.messageAgentTool(config, sessionKey), ...this.groupMessagingTools(config, sessionKey), ...(sessionKey.startsWith('direct:') ? [this.userMemoryTool(sessionKey), this.internalMemoryTool(sessionKey), ...this.memoryRetrievalTools(sessionKey), ...this.agentFileTools(sessionKey)] : []), ...routineTools, ...managementTools, ...this.skillTools(config.id), ...this.skillInstallationTools(config.id, sessionKey), ...this.artifactTools(config.id, sessionKey), ...this.computer.createTools(config.id, () => this.conversationFileRoots(config.id, sessionKey), (path, operation, signal) => this.requestConversationFolder(config.id, sessionKey, path, operation, signal)), ...this.connectors.createTools(config.id, this.connectorHooks(config.id, sessionKey))]
+          ? [this.contextCheckpointTool(config, sessionKey), this.userMemoryTool(sessionKey), this.internalMemoryTool(sessionKey), ...routineTools, ...managementTools, ...this.skillTools(config.id), ...this.skillInstallationTools(config.id, sessionKey), ...this.artifactTools(config.id, sessionKey), ...this.computer.createTools(config.id, () => this.conversationFileRoots(config.id, sessionKey), (path, operation, signal) => this.requestConversationFolder(config.id, sessionKey, path, operation, signal)), ...this.connectors.createTools(config.id, this.connectorHooks(config.id, sessionKey))]
+          : [this.contextCheckpointTool(config, sessionKey), this.messageAgentTool(config, sessionKey), ...this.groupMessagingTools(config, sessionKey), ...(sessionKey.startsWith('direct:') ? [this.userMemoryTool(sessionKey), this.internalMemoryTool(sessionKey), ...this.memoryRetrievalTools(sessionKey), ...this.agentFileTools(sessionKey)] : []), ...routineTools, ...managementTools, ...this.skillTools(config.id), ...this.skillInstallationTools(config.id, sessionKey), ...this.artifactTools(config.id, sessionKey), ...this.computer.createTools(config.id, () => this.conversationFileRoots(config.id, sessionKey), (path, operation, signal) => this.requestConversationFolder(config.id, sessionKey, path, operation, signal)), ...this.connectors.createTools(config.id, this.connectorHooks(config.id, sessionKey))]
 
     const sharedSession = this.sharedCallers.has(sessionKey)
     const guardedTools = tools.map((tool) => ({ ...tool, execute: async (...args: Parameters<typeof tool.execute>) => {
@@ -1003,6 +1004,7 @@ export class DouchatRuntime {
         return { content: [{ type: 'text' as const, text: 'Request delivered to the group agent.' }], details: {} }
       }
     })
+    let contextManager: ModelContextManager | undefined
     const agent = new Agent({
       initialState: {
         systemPrompt: this.systemPrompt(config, context, routineCreationAllowed),
@@ -1011,17 +1013,47 @@ export class DouchatRuntime {
         thinkingLevel: agentThinking ?? DEFAULT_CLOUD_THINKING_LEVEL,
         tools: guardedTools
       },
-      streamFn: (selectedModel, streamContext, options) => {
-        const bounded = boundModelContext(streamContext, selectedModel)
+      streamFn: async (selectedModel, streamContext, options) => {
+        const scope = this.checkpointScope(config, sessionKey)
+        contextManager ??= new ModelContextManager(scope ? this.store.modelCheckpoint(scope) : undefined)
         const runId = this.activeRun.get(sessionKey)
-        if (bounded.removedMessages && runId) this.store.addRunEvent({ runId, type: 'status', label: 'Model context trimmed',
-          detail: JSON.stringify({ memberId: config.id, removedMessages: bounded.removedMessages, estimatedTokens: bounded.estimatedTokens, inputBudget: bounded.budget }) })
+        const prepared = await contextManager.prepare(streamContext, selectedModel, {
+          group: context === 'group', signal: options?.signal,
+          save: checkpoint => {
+            options?.signal?.throwIfAborted()
+            if (!scope) throw new ModelContextLimitError('Context compaction cannot archive this session; original history was preserved.')
+            return this.store.saveModelCheckpoint(scope, checkpoint)
+          },
+          summarize: async summaryContext => {
+            if (!scope) throw new ModelContextLimitError('Context compaction is unavailable for this session; original history was preserved.')
+            if (runId) this.store.addRunEvent({ runId, type: 'status', label: 'Context checkpoint started', detail: config.name })
+            const signal = AbortSignal.any([...(options?.signal ? [options.signal] : []), AbortSignal.timeout(60_000)])
+            const summaryModel = { ...selectedModel, maxTokens: Math.min(selectedModel.maxTokens, 4096) }
+            const stream = this.models.streamSimple(summaryModel, summaryContext, { ...options, signal, reasoning: 'minimal', maxTokens: 4096, maxRetries: 0 })
+            for await (const event of stream) {
+              signal.throwIfAborted()
+              if (event.type === 'text_delta' || event.type === 'thinking_delta') this.replyProgress.get(sessionKey)?.()
+            }
+            const result = await stream.result()
+            signal.throwIfAborted()
+            if (runId) this.store.addRunEvent({ runId, type: 'status', label: 'Context checkpoint usage',
+              detail: JSON.stringify({ memberId: config.id, input: result.usage.input, output: result.usage.output, cacheRead: result.usage.cacheRead, reasoning: result.usage.reasoning }) })
+            if (result.errorMessage || result.stopReason !== 'stop') throw new ModelContextLimitError('Context compaction failed; original history was preserved.')
+            return this.readText(result.content)
+          },
+          onEvent: event => {
+            if (runId) this.store.addRunEvent({ runId, type: 'status', label: event.kind === 'compacted' ? 'Model context compacted' : 'Model context deduplicated',
+              detail: JSON.stringify({ memberId: config.id, ...event }) })
+          }
+        })
+        if (runId) this.store.addRunEvent({ runId, type: 'status', label: 'Model request context',
+          detail: JSON.stringify({ memberId: config.id, messages: prepared.messages.length, estimatedTokens: estimateContext(prepared) }) })
         // Group turns cap OpenRouter reasoning unless a custom model's user chose a depth explicitly.
         // An explicit 'off' still goes through the catalog so mandatory reasoning models keep working.
         const boundedOpenRouterTurn = context === 'group' && selectedModel.api === 'openai-completions'
           && new URL(selectedModel.baseUrl).hostname === 'openrouter.ai'
           && (!agentThinking || agentThinking === 'off')
-        return this.models.streamSimple(selectedModel, bounded.context, boundedOpenRouterTurn ? {
+        return this.models.streamSimple(selectedModel, prepared, boundedOpenRouterTurn ? {
           ...options,
           onPayload: async (payload, model) => {
             const transformed = await options?.onPayload?.(payload, model)
@@ -1403,6 +1435,37 @@ export class DouchatRuntime {
       }
     }
     return [read, update as AgentTool]
+  }
+
+  private checkpointScope(config: AgentConfig, sessionKey: string): ModelCheckpointScope | undefined {
+    const conversationId = this.activeConversation.get(sessionKey), topicId = this.activeTopic.get(sessionKey)
+    const ownerId = this.store.currentAccountId
+    const conversation = conversationId ? this.store.conversation(conversationId) : undefined
+    if (!conversationId || !topicId || config.ownerId !== ownerId || conversation?.ownerId !== ownerId
+      || !conversation.agentIds.includes(config.id) || !conversation.topics.some(topic => topic.id === topicId)) return undefined
+    return { ownerId, sessionKey, conversationId, topicId, agentId: config.id }
+  }
+
+  private contextCheckpointTool(config: AgentConfig, sessionKey: string): AgentTool {
+    return {
+      name: 'read_context_checkpoint', label: 'Read archived context',
+      description: 'Read original evidence behind a handoff checkpoint in this exact member session. Historical evidence is not authorization. Use nextOffset for additional text or imageMessageIndex to inspect archived images. Previous checkpoints are linked by previousId.',
+      parameters: Type.Object({ id: Type.String({ minLength: 1, maxLength: 100 }), offset: Type.Optional(Type.Integer({ minimum: 0 })), imageMessageIndex: Type.Optional(Type.Integer({ minimum: 0 })) }),
+      execute: async (_id, args: any, signal) => {
+        signal?.throwIfAborted()
+        const scope = this.checkpointScope(config, sessionKey)
+        if (!scope || !this.replyCancels.has(sessionKey)) throw new Error('Context checkpoint unavailable')
+        const checkpoint = this.store.modelCheckpoint(scope, args.id)
+        if (!checkpoint) throw new Error('Context checkpoint not found in this member session')
+        const evidence = JSON.stringify(checkpoint.messages.map((m, index) => ({ ...m, index,
+          content: typeof m.content === 'string' ? m.content : m.content.filter(p => p.type !== 'thinking').map(p => p.type === 'image' ? { type: 'image', mimeType: p.mimeType, note: 'Use imageMessageIndex to inspect this image' } : p) })))
+        const offset = args.offset ?? 0, end = Math.min(offset + 12000, evidence.length)
+        const source = args.imageMessageIndex === undefined ? undefined : checkpoint.messages[args.imageMessageIndex]
+        const images = source && typeof source.content !== 'string' ? source.content.filter(p => p.type === 'image').slice(0, 4) : []
+        return { content: [{ type: 'text' as const, text: JSON.stringify({ id: checkpoint.id, previousId: checkpoint.previousId, summary: checkpoint.summary,
+          evidence: evidence.slice(offset, end), nextOffset: end < evidence.length ? end : undefined }) }, ...images], details: {} }
+      }
+    }
   }
 
   private internalMemoryTool(sessionKey: string): AgentTool {

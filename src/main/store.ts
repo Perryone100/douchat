@@ -1,3 +1,4 @@
+import type { ContextCheckpoint } from './modelContext'
 import { drDouLocalizations, localizedBuiltInAgent, builtInDefaultValues } from '../shared/builtInAgentLocalization'
 import { supportedInterfaceLanguage, type InterfaceLanguage } from '../shared/language'
 import type { AccountContext } from '../shared/accountData'
@@ -124,6 +125,8 @@ function inferredBuiltInOverrides(agent: AgentConfig): BuiltInAgentUserOverrides
   return overrides
 }
 
+export type ModelCheckpointScope = { ownerId: string; sessionKey: string; conversationId: string; topicId: string; agentId: string }
+
 interface DouchatStoreOptions {
   /** Retained only for orchestration fixtures that need the original demo crew. */
   seedDemo?: boolean
@@ -184,6 +187,18 @@ CREATE TABLE IF NOT EXISTS groupWorkflows (
   ownerId TEXT NOT NULL,
   data TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS modelCheckpoints (
+  ownerId TEXT NOT NULL,
+  sessionKey TEXT NOT NULL,
+  id TEXT NOT NULL,
+  conversationId TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  topicId TEXT NOT NULL,
+  agentId TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  data TEXT NOT NULL,
+  PRIMARY KEY (ownerId, sessionKey, id)
+);
+CREATE INDEX IF NOT EXISTS model_checkpoints_topic ON modelCheckpoints(conversationId, topicId);
 
 CREATE TABLE IF NOT EXISTS privateMessages (
   id             TEXT PRIMARY KEY,
@@ -2103,6 +2118,39 @@ export class DouchatStore {
     this.putConversation(conversation)
   }
 
+  private assertCheckpointScope(scope: ModelCheckpointScope): void {
+    const conversation = this.conversation(scope.conversationId)
+    if (scope.ownerId !== this.currentAccountId || conversation?.ownerId !== scope.ownerId
+      || this.agent(scope.agentId)?.ownerId !== scope.ownerId || !conversation.agentIds.includes(scope.agentId)
+      || !conversation.topics.some(topic => topic.id === scope.topicId)) throw new Error('Context checkpoint unavailable in this conversation')
+  }
+
+  modelCheckpoint(scope: ModelCheckpointScope, id?: string): ContextCheckpoint | undefined {
+    this.assertCheckpointScope(scope)
+    const rows = this.all<ContextCheckpoint & { boundary: { resetId: string | null; messageId?: string } }>(`SELECT data FROM modelCheckpoints WHERE ownerId = ? AND sessionKey = ? AND conversationId = ? AND topicId = ? AND agentId = ?${id ? ' AND id = ?' : ''} ORDER BY rowid DESC LIMIT 1`,
+      scope.ownerId, scope.sessionKey, scope.conversationId, scope.topicId, scope.agentId, ...(id ? [id] : []))
+    const record = rows[0]
+    if (!record) return undefined
+    const resetId = this.conversation(scope.conversationId)?.topics.find(topic => topic.id === scope.topicId)?.contextReset?.id ?? null
+    // An older client can reset/clear chat without knowing this additive table.
+    // Never resurrect stale summaries after a code rollback and re-upgrade.
+    if (!record.boundary || record.boundary.resetId !== resetId || record.boundary.messageId
+      && !this.contextMessages(scope.conversationId, scope.topicId).some(message => message.id === record.boundary.messageId)) return undefined
+    const { boundary: _boundary, ...checkpoint } = record
+    return checkpoint
+  }
+
+  saveModelCheckpoint(scope: ModelCheckpointScope, checkpoint: ContextCheckpoint): ContextCheckpoint {
+    this.assertCheckpointScope(scope)
+    const boundary = { resetId: this.conversation(scope.conversationId)?.topics.find(topic => topic.id === scope.topicId)?.contextReset?.id ?? null,
+      messageId: this.contextMessages(scope.conversationId, scope.topicId).at(-1)?.id }
+    const data = JSON.stringify({ ...checkpoint, boundary })
+    if (Buffer.byteLength(data) > 32 * 1024 * 1024) throw new Error('Context checkpoint archive exceeds its storage limit; history preserved')
+    this.write('INSERT OR REPLACE INTO modelCheckpoints (ownerId, sessionKey, id, conversationId, topicId, agentId, data) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      scope.ownerId, scope.sessionKey, checkpoint.id, scope.conversationId, scope.topicId, scope.agentId, data)
+    return checkpoint
+  }
+
   // ───────────────────────────── topics ─────────────────────────────
 
   createTopic(conversationId: string): Topic | undefined {
@@ -2136,6 +2184,7 @@ export class DouchatStore {
       this.write('DELETE FROM messages WHERE conversationId = ? AND topicId = ?', conversationId, topicId)
       this.write('DELETE FROM privateMessages WHERE conversationId = ? AND topicId = ?', conversationId, topicId)
       this.write('DELETE FROM groupGames WHERE conversationId = ? AND topicId = ?', conversationId, topicId)
+      this.write('DELETE FROM modelCheckpoints WHERE conversationId = ? AND topicId = ?', conversationId, topicId)
       this.write('DELETE FROM groupWorkflows WHERE conversationId = ? AND topicId = ?', conversationId, topicId)
     })
   }
@@ -2210,6 +2259,7 @@ export class DouchatStore {
       topic.contextReset = reset
       if (conversation.type === 'group') this.saveGroupHealth(conversationId, {})
       this.write('DELETE FROM groupGames WHERE conversationId = ? AND topicId = ?', conversationId, topicId)
+      this.write('DELETE FROM modelCheckpoints WHERE conversationId = ? AND topicId = ?', conversationId, topicId)
       this.putConversation(conversation)
     })
   }
@@ -2335,6 +2385,7 @@ export class DouchatStore {
       }
       if (topicId === undefined) {
         this.write('DELETE FROM groupGames WHERE conversationId = ?', conversationId)
+        this.write('DELETE FROM modelCheckpoints WHERE conversationId = ?', conversationId)
         this.write('DELETE FROM groupWorkflows WHERE conversationId = ?', conversationId)
         this.write('DELETE FROM messages WHERE conversationId = ?', conversationId)
         this.write('DELETE FROM privateMessages WHERE conversationId = ?', conversationId)
@@ -2343,6 +2394,7 @@ export class DouchatStore {
       this.write('DELETE FROM messages WHERE conversationId = ? AND topicId = ?', conversationId, topicId)
       this.write('DELETE FROM privateMessages WHERE conversationId = ? AND topicId = ?', conversationId, topicId)
       this.write('DELETE FROM groupGames WHERE conversationId = ? AND topicId = ?', conversationId, topicId)
+      this.write('DELETE FROM modelCheckpoints WHERE conversationId = ? AND topicId = ?', conversationId, topicId)
       this.write('DELETE FROM groupWorkflows WHERE conversationId = ? AND topicId = ?', conversationId, topicId)
       const conversation = this.conversation(conversationId)
       const topic = conversation?.topics.find((item) => item.id === topicId)

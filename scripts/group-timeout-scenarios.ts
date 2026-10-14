@@ -51,7 +51,7 @@ async function main() {
     // Reproduce accumulated history and usage without sending private content
     // or paying to generate an oversized transcript.
     session.state.messages = [
-      { role: 'user', content: '旧的合成测试上下文。'.repeat(20000), timestamp: 1 },
+      { role: 'user', content: '旧的合成测试上下文。'.repeat(6000), timestamp: 1 },
       { role: 'assistant', api: 'openai-completions', provider: agent.provider, model, timestamp: 2,
         content: [{ type: 'text', text: 'Earlier synthetic work completed.' }], stopReason: 'stop',
         usage: { input: 131882, output: 1, cacheRead: 4864, cacheWrite: 0, totalTokens: 136747, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } }
@@ -60,7 +60,7 @@ async function main() {
     const start = Date.now()
     const reply = await internal.runReply({ config: agent, sessionKey, context: 'direct', prompt: '这是独立测试。本次只回复 CONTEXT_OK，不做其他操作。',
       conversationId: conversation.id, topicId: conversation.activeTopicId, runId: run.id, toolsDisabled: true, timeoutMs: 60000 })
-    const trims = store.runEvents.filter(event => event.runId === run.id && event.label === 'Model context trimmed')
+    const trims = store.runEvents.filter(event => event.runId === run.id && event.label === 'Model context compacted')
     const passed = !reply.error && reply.text.includes('CONTEXT_OK') && trims.length > 0
     const usage = session.state.messages.at(-1)?.usage
     record({ scenario: 'long-context-reply', passed, elapsedMs: Date.now() - start, requests, text: reply.text, error: reply.error,
