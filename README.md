@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="docs/fork-overview.zh-CN.md">中文使用与维护说明</a> ·
-  <a href="docs/rollback.zh-CN.md">版本与回退</a> ·
+  <a href="docs/versions.zh-CN.md">版本记录</a> ·
   <a href="https://github.com/Perryone100/douchat/pull/1">超时修复 PR</a> ·
   <a href="https://douchat.ai">Upstream website</a> ·
   <a href="#quick-start">Quick start</a> ·

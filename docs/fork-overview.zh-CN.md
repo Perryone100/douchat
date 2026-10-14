@@ -40,7 +40,7 @@ DeepSeek 规划请求显式使用低推理及 JSON 输出，成员正式工作�
 已有的依赖关系执行、完成步骤重放、人工确认与工具权限继续保留。
 
 详见修复分支中的 [规划实现与复现](https://github.com/Perryone100/douchat/blob/codex/fix-planning-timeouts/docs/group-planning-reliability.md)、
-[上下文与成本](model-context-budget.md) 和 [版本回退说明](rollback.zh-CN.md)。
+[上下文与成本](model-context-budget.md) 和 [版本记录](versions.zh-CN.md)。
 
 ## 从源码启动修复版
 
