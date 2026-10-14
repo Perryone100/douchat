@@ -253,10 +253,51 @@ it('applies the configured reasoning policy to streamed group replies while pres
   const agent = internal.session({ ...agents[0], provider: 'custom:openrouter', model: 'fixture' }, `group:${group.id}:fixture`, 'group')
   const original = { model: 'fixture', messages: [{ role: 'user', content: 'Work' }], tools: [{ name: 'authorized-tool' }] }
   const signal = new AbortController().signal
-  agent.streamFunction(agent.state.model, { messages: [] }, { signal, onPayload: (payload: object) => ({ ...payload, temperature: 0.2 }) })
+  await agent.streamFunction(agent.state.model, { messages: [] }, { signal, onPayload: (payload: object) => ({ ...payload, temperature: 0.2 }) })
   const output = await (transport.mock.calls[0][2] as any).onPayload(original, agent.state.model)
   expect(output).toEqual({ ...original, temperature: 0.2, reasoning: { enabled: false, exclude: true } })
   expect(policy).toHaveBeenCalledWith('fixture', signal)
+})
+
+it('compacts hosted requests with a saved handoff before the real stream boundary', async () => {
+  const { runtime, store, agents, group, internal } = fixture()
+  runtime.configureCustomModels([{ id: 'fixture', name: 'Fixture', kind: 'openai', apiBase: 'https://fixture.invalid/v1', apiKey: 'fixture', models: ['fixture'] }])
+  const summary = { goalsAndConstraints: ['Old requirement retained'], decisions: [], completedWork: [], pendingWork: ['Current task'], references: [], uncertainties: [] }
+  const stream = { async *[Symbol.asyncIterator]() {}, result: async () => ({ stopReason: 'stop', content: [{ type: 'text', text: JSON.stringify(summary) }], usage: { input: 200, output: 100 } }) }
+  const transport = vi.spyOn(internal.models, 'streamSimple').mockReturnValue(stream)
+  const key = `group:${group.id}:context`
+  internal.activeConversation.set(key, group.id)
+  internal.activeTopic.set(key, group.activeTopicId)
+  const agent = internal.session({ ...agents[0], provider: 'custom:fixture', model: 'fixture' }, key, 'group')
+  const messages = [{ role: 'user', content: 'Old requirement retained', timestamp: 1 },
+    { role: 'assistant', content: [{ type: 'text', text: 'Prior result' }], usage: { totalTokens: 136747 }, stopReason: 'stop', timestamp: 2 },
+    { role: 'user', content: 'Current task', timestamp: 3 }]
+  await agent.streamFunction(agent.state.model, { messages, systemPrompt: 'Existing permissions and identity' }, {})
+  expect(transport).toHaveBeenCalledTimes(2)
+  expect((transport.mock.calls[0][0] as any).maxTokens).toBe(4096)
+  expect(transport.mock.calls[0][2]).toMatchObject({ maxTokens: 4096, maxRetries: 0, reasoning: 'minimal' })
+  const sent = transport.mock.calls[1][1] as any
+  expect(sent.messages.at(-1)).toEqual(messages[2])
+  expect(JSON.stringify(sent.messages[0])).toContain('Old requirement retained')
+  expect(sent.systemPrompt).toBe('Existing permissions and identity')
+  expect(messages).toHaveLength(3)
+  expect(store.modelCheckpoint({ ownerId: store.currentAccountId, conversationId: group.id, topicId: group.activeTopicId, agentId: agents[0].id, sessionKey: key })?.messages).toEqual(messages.slice(0, 2))
+})
+
+it('names a new-message context failure and recovers without exposing provider details', async () => {
+  const { runtime, store, agents, group, internal } = fixture()
+  internal.runReply = async ({ config, context, prompt }: any) => {
+    if (context === 'controller') return scriptedPolicy(prompt, agents)
+    return config.id === agents[1].id
+      ? { text: '', error: 'maximum context length exceeded: PRIVATE_PROVIDER_BODY' }
+      : { text: '接替完成这条新消息。' }
+  }
+  await runtime.sendMessage(group.id, '@产品 需要我决定什么？')
+  const notices = store.topicMessages(group.id, group.activeTopicId).filter(message => message.kind === 'system').map(message => message.text).join('\n')
+  expect(notices).toContain('未能回答这条新消息')
+  expect(notices).toContain('对话上下文过长')
+  expect(notices).not.toContain('PRIVATE_PROVIDER_BODY')
+  expect(store.groupWorkflows()[0].status).toBe('completed')
 })
 
 it('repairs a private-only public assignment from public context before downstream work starts', async () => {
@@ -351,7 +392,7 @@ it('recovers a finished journal by replaying saved outputs without another model
   expect(workflow.group.members.map(member => member.id)).toContain(agents[2].id)
 })
 
-it.each(['leader', 'jev'])('reviews %s attendance with a compact roster decision instead of a full task plan', async mode => {
+it.each(['jev'])('reviews %s attendance with a compact roster decision instead of a full task plan', async mode => {
   const { runtime, store, group, agents, internal } = fixture()
   store.saveDecisionSettings({ mode: mode === 'leader' ? 'leader' : 'model', providerId: 'test', model: 'jev' })
   internal.decisionProvider = async () => ({ id: 'test' })
@@ -375,7 +416,7 @@ it.each(['leader', 'jev'])('reviews %s attendance with a compact roster decision
   expect(store.groupWorkflows()[0].status).toBe('completed')
 })
 
-it.each(['leader', 'jev'])('falls back to full planning when %s lightweight participation review declines', async mode => {
+it.each(['jev'])('falls back to full planning when %s lightweight participation review declines', async mode => {
   const { runtime, store, group, agents, internal } = fixture()
   store.saveDecisionSettings({ mode: mode === 'leader' ? 'leader' : 'model', providerId: 'test', model: 'jev' })
   internal.decisionProvider = async () => ({ id: 'test' })
@@ -418,21 +459,21 @@ it.each(['complete', 'waiting', 'continue'])('uses compact default result review
   expect(store.groupWorkflows()[0].status).toBe(status === 'waiting' ? 'waiting' : 'completed')
 })
 
-it('allows a 45-second member plan without the old 20-second request cutoff', async () => {
+it('allows a productive 90-second member plan and then completes the task', async () => {
   const { runtime, store, group, agents, internal } = fixture()
   let controllerCalls = 0
-  internal.runReply = async ({ context, prompt, timeoutMs, signal }: any) => {
+  internal.runReply = async ({ context, prompt, timeoutMs, signal, onProgress }: any) => {
     if (context !== 'controller') return { text: '已完成。' }
     controllerCalls++
-    expect(timeoutMs).toBe(60_000)
-    await new Promise(resolve => setTimeout(resolve, 45_000))
+    expect(timeoutMs).toBe(180_000)
+    for (let i = 0; i < 3; i++) { await new Promise(resolve => setTimeout(resolve, 30_000)); onProgress() }
     signal.throwIfAborted()
     return scriptedPolicy(prompt, agents)
   }
   vi.useFakeTimers()
   try {
     const pending = runtime.sendMessage(group.id, '给出方案')
-    await vi.advanceTimersByTimeAsync(95_000)
+    await vi.advanceTimersByTimeAsync(185_000)
     await pending
     expect(controllerCalls).toBe(2)
     expect(store.groupWorkflows()[0].status).toBe('completed')
@@ -615,8 +656,8 @@ it('starts each policy-classified roll call from 1 despite historical replies an
 
 it('automatically reaches a third planner after two timeouts and completes the task once', async () => {
   const { runtime, store, agents, group, internal } = fixture()
-  runtime.configureCustomModels([{ id: 'cloud', name: 'Cloud', kind: 'openai', apiBase: 'https://fixture.invalid/v1', apiKey: 'test', models: ['planner'] }])
-  for (const agent of agents) store.updateAgent(agent.id, { provider: 'custom:cloud', model: 'planner' })
+  runtime.configureCustomModels([{ id: 'cloud', name: 'Cloud', kind: 'openai', apiBase: 'https://fixture.invalid/v1', apiKey: 'test', models: agents.map((_, i) => `planner-${i}`) }])
+  agents.forEach((agent, i) => store.updateAgent(agent.id, { provider: 'custom:cloud', model: `planner-${i}` }))
   const slowSignals: AbortSignal[] = []
   const planners: string[] = []
   vi.spyOn(internal.groupDecisionService, 'plan').mockImplementation(async (...args: any[]) => {
@@ -1026,4 +1067,41 @@ it.each(['en', 'zh-CN'] as const)('keeps the local task deadline and reports int
   expect(workflow.error).toContain(language === 'en' ? 'will not be repeated automatically' : '不会自动重复执行')
   const publicText = store.topicMessages(group.id, group.activeTopicId).map(message => [message.text, message.detail].join('\n')).join('\n')
   expect(publicText).toContain('Reply timed out after 15 minutes')
+})
+
+it('plans initial member work once without an attendance preflight and executes dependency outputs', async () => {
+  const { runtime, store, agents, group, internal } = fixture()
+  let plans = 0
+  internal.runReply = async ({ context, prompt }: any) => {
+    const payload = JSON.parse(prompt.slice(prompt.indexOf('{')))
+    if (context === 'controller') {
+      plans++
+      expect(prompt).not.toContain('Review only whether')
+      return { text: JSON.stringify(payload.completedTurns.length ? { mode: 'none', memberIds: [], triggerMessageIds: [] } : {
+        mode: 'parallel', leaderMemberId: agents[0].id, memberIds: [agents[1].id, agents[2].id, agents[0].id], triggerMessageIds: [payload.currentRequest.id],
+        tasks: [
+          { id: 'draft', memberId: agents[1].id, instruction: 'Draft', dependsOn: [], expectedOutput: 'Draft' },
+          { id: 'review', memberId: agents[2].id, instruction: 'Review draft', dependsOn: ['draft'], expectedOutput: 'Review' },
+          { id: 'final', memberId: agents[0].id, instruction: 'Summarize', dependsOn: ['draft', 'review'], expectedOutput: 'Final' }
+        ]
+      }) }
+    }
+    if (payload.turn.taskId === 'review') expect(prompt).toContain('Actual draft')
+    if (payload.turn.taskId === 'final') { expect(prompt).toContain('Actual draft'); expect(prompt).toContain('Actual review') }
+    return { text: `Actual ${payload.turn.taskId}` }
+  }
+  await runtime.sendMessage(group.id, 'Draft a document, review it, then consolidate the results')
+  expect(plans).toBe(2) // initial plan + completion review
+  expect(store.groupWorkflows()[0].status).toBe('completed')
+  expect(Object.keys(store.groupWorkflows()[0].calls).filter(key => key.startsWith('task:'))).toHaveLength(3)
+})
+it('reports hosted controller activity even without a worker run id', () => {
+  const { internal, agents } = fixture()
+  internal.resolveModel = () => ({ id: 'fixture', provider: 'test', api: 'openai-completions', baseUrl: 'https://fixture.invalid', input: ['text'], reasoning: false, contextWindow: 1000, maxTokens: 100 })
+  const key = 'controller:progress', progress = vi.fn()
+  const agent = internal.session(agents[0], key, 'controller', true)
+  internal.replyProgress.set(key, progress)
+  // Agent lifecycle listeners receive SDK progress for tool-free controllers too.
+  for (const listener of agent.listeners) listener({ type: 'message_update' })
+  expect(progress).toHaveBeenCalledOnce()
 })

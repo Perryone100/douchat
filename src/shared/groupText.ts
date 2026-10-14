@@ -4,6 +4,13 @@ import type { InterfaceLanguage } from './language'
 export const groupTranslations: Record<string, string> = {
   'Scheduling: {member} is not configured to run. Skipping this round.': '调度通知：{member} 当前运行配置不可用，本轮已跳过。',
   'Scheduling: {member} did not complete this reply. Deciding what happens next.': '调度通知：{member} 本次回复未完成，正在安排后续处理。',
+  'Scheduling: {member} could not answer the current request: {reason}. Deciding what happens next.': '调度通知：{member} 未能回答这条新消息，原因：{reason}。正在安排后续处理。',
+  'The conversation context is too long': '对话上下文过长',
+  'The model output limit was reached': '模型输出额度不足或已达到上限',
+  'The model reply timed out': '等待模型回复超时',
+  'The model service is rate limited': '模型服务触发限流',
+  'The model could not authenticate': '模型服务认证失败',
+  'The model returned no usable reply': '模型未返回有效回复',
   'Round complete: {count} replied; {absent} did not reply this round ({members}).': '本轮已结束：{count} 人已回复，{absent} 人本轮未回复（{members}）。',
   '{member}: {reason}. Trying another coordinator.': '{member}：{reason}，正在自动切换下一位协调成员。',
   'Planning response timed out': '等待规划响应超时',
@@ -36,6 +43,7 @@ export const groupTranslations: Record<string, string> = {
   "The model returned no usable decision content (output limit reached).": "决策模型没有返回有效内容（输出预算耗尽）。",
   "The model returned no usable decision content (upstream reasoning failed).": "决策模型没有返回有效内容（上游推理失败）。",
 
+  "This coordinator produced no planning output for {seconds} seconds.": "该协调成员连续 {seconds} 秒没有产生规划输出。",
   "Group decision service": "群决策服务",
   "Choose who decides whether group messages need a reply and which members handle them. Members still use their own models to do the work.": "选择谁来判断群消息是否需要回复、由哪些成员处理。成员仍使用各自的模型完成任务。",
   "Decision mode": "决策方式",

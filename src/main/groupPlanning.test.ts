@@ -74,3 +74,39 @@ it('stops immediately on human cancellation instead of moving to another planner
   expect(attempt.aborted).toBe(true)
   expect(spare).not.toHaveBeenCalled()
 })
+
+it('lets a productive planner run past the old 60 second wall deadline', async () => {
+  vi.useFakeTimers()
+  let progress!: () => void, finish!: (plan: string) => void
+  const spare = vi.fn(async () => 'spare')
+  const result = firstGroupPlan([{ run: (_signal, activity) => { progress = activity; return new Promise<string>(resolve => { finish = resolve }) } }, { run: spare }], new AbortController().signal)
+  for (let i = 0; i < 3; i++) { await vi.advanceTimersByTimeAsync(30_000); progress() }
+  finish('complete plan after 90s')
+  expect(await result).toBe('complete plan after 90s')
+  expect(spare).not.toHaveBeenCalled()
+})
+it('still bounds a planner that produces progress forever', async () => {
+  vi.useFakeTimers()
+  let progress!: () => void
+  const result = firstGroupPlan([{ run: (_signal, activity) => { progress = activity; return new Promise<never>(() => {}) } }], new AbortController().signal)
+  const assertion = expect(result).rejects.toThrow('180 seconds')
+  for (let i = 0; i < 6; i++) { await vi.advanceTimersByTimeAsync(30_000); progress() }
+  await assertion
+})
+it('skips the same stalled backend but can fail over to another backend', async () => {
+  vi.useFakeTimers()
+  const duplicate = vi.fn(async () => 'duplicate backend'), backup = vi.fn(async () => 'backup')
+  const result = firstGroupPlan([
+    { backendKey: 'provider/model', run: () => new Promise<never>(() => {}) },
+    { backendKey: 'provider/model', run: duplicate }, { backendKey: 'other/model', run: backup }
+  ], new AbortController().signal)
+  await vi.advanceTimersByTimeAsync(60_000)
+  expect(await result).toBe('backup')
+  expect(duplicate).not.toHaveBeenCalled()
+})
+it('does not suppress another persona after a schema error on the same backend', async () => {
+  expect(await firstGroupPlan([
+    { backendKey: 'p/m', run: async () => { throw new Error('Invalid plan: wait 60 seconds') } },
+    { backendKey: 'p/m', run: async () => 'fixed' }
+  ], new AbortController().signal)).toBe('fixed')
+})

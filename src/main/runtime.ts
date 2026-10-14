@@ -19,7 +19,7 @@ import { agentIdentityPrompt, agentPersona, validateAgentFiles, withoutSkillFile
 import { groupMemoryPrompt, userMemoryPrompt, localUserMemoryEdits, MEMORY_OPEN, MEMORY_CLOSE, type UserMemoryEdit } from '../shared/userMemory'
 import { groupNotice, groupText } from '../shared/groupText'
 import { CUSTOM_PROVIDER_PREFIX } from '../shared/customModels'
-import { cancellableGroupPlan, firstGroupPlan, planningFailureReason, GROUP_PLANNING_ATTEMPT_MS, GROUP_PLANNING_BUDGET_MS } from './groupPlanning'
+import { cancellableGroupPlan, firstGroupPlan, planningFailureReason, GROUP_PLANNING_BUDGET_MS } from './groupPlanning'
 import { DecisionEscalation, GroupDecisionService } from './groupDecision'
 import { rankGroupMembers, refreshGroupHealth, type GroupHealth } from './groupHealth'
 import { GroupGames } from './groupGames'
@@ -46,6 +46,8 @@ import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { basename, join, dirname, isAbsolute } from 'node:path'
 import { Agent, type AgentTool } from '@earendil-works/pi-agent-core'
+import { ModelContextManager, ModelContextLimitError, estimateContext, memberFailureReason } from './modelContext'
+import type { ModelCheckpointScope } from './store'
 import { DEFAULT_CLOUD_THINKING_LEVEL } from '../shared/thinkingLevels'
 import { Type, type ImageContent } from '@earendil-works/pi-ai'
 import { builtinModels } from '@earendil-works/pi-ai/providers/all'
@@ -959,8 +961,8 @@ export class DouchatRuntime {
       context === 'controller' || toolsDisabled
         ? []
         : context === 'group'
-          ? [this.userMemoryTool(sessionKey), this.internalMemoryTool(sessionKey), ...routineTools, ...managementTools, ...this.skillTools(config.id), ...this.skillInstallationTools(config.id, sessionKey), ...this.artifactTools(config.id, sessionKey), ...this.computer.createTools(config.id, () => this.conversationFileRoots(config.id, sessionKey), (path, operation, signal) => this.requestConversationFolder(config.id, sessionKey, path, operation, signal)), ...this.connectors.createTools(config.id, this.connectorHooks(config.id, sessionKey))]
-          : [this.messageAgentTool(config, sessionKey), ...this.groupMessagingTools(config, sessionKey), ...(sessionKey.startsWith('direct:') ? [this.userMemoryTool(sessionKey), this.internalMemoryTool(sessionKey), ...this.memoryRetrievalTools(sessionKey), ...this.agentFileTools(sessionKey)] : []), ...routineTools, ...managementTools, ...this.skillTools(config.id), ...this.skillInstallationTools(config.id, sessionKey), ...this.artifactTools(config.id, sessionKey), ...this.computer.createTools(config.id, () => this.conversationFileRoots(config.id, sessionKey), (path, operation, signal) => this.requestConversationFolder(config.id, sessionKey, path, operation, signal)), ...this.connectors.createTools(config.id, this.connectorHooks(config.id, sessionKey))]
+          ? [this.contextCheckpointTool(config, sessionKey), this.userMemoryTool(sessionKey), this.internalMemoryTool(sessionKey), ...routineTools, ...managementTools, ...this.skillTools(config.id), ...this.skillInstallationTools(config.id, sessionKey), ...this.artifactTools(config.id, sessionKey), ...this.computer.createTools(config.id, () => this.conversationFileRoots(config.id, sessionKey), (path, operation, signal) => this.requestConversationFolder(config.id, sessionKey, path, operation, signal)), ...this.connectors.createTools(config.id, this.connectorHooks(config.id, sessionKey))]
+          : [this.contextCheckpointTool(config, sessionKey), this.messageAgentTool(config, sessionKey), ...this.groupMessagingTools(config, sessionKey), ...(sessionKey.startsWith('direct:') ? [this.userMemoryTool(sessionKey), this.internalMemoryTool(sessionKey), ...this.memoryRetrievalTools(sessionKey), ...this.agentFileTools(sessionKey)] : []), ...routineTools, ...managementTools, ...this.skillTools(config.id), ...this.skillInstallationTools(config.id, sessionKey), ...this.artifactTools(config.id, sessionKey), ...this.computer.createTools(config.id, () => this.conversationFileRoots(config.id, sessionKey), (path, operation, signal) => this.requestConversationFolder(config.id, sessionKey, path, operation, signal)), ...this.connectors.createTools(config.id, this.connectorHooks(config.id, sessionKey))]
 
     const sharedSession = this.sharedCallers.has(sessionKey)
     const guardedTools = tools.map((tool) => ({ ...tool, execute: async (...args: Parameters<typeof tool.execute>) => {
@@ -1002,6 +1004,7 @@ export class DouchatRuntime {
         return { content: [{ type: 'text' as const, text: 'Request delivered to the group agent.' }], details: {} }
       }
     })
+    let contextManager: ModelContextManager | undefined
     const agent = new Agent({
       initialState: {
         systemPrompt: this.systemPrompt(config, context, routineCreationAllowed),
@@ -1010,13 +1013,47 @@ export class DouchatRuntime {
         thinkingLevel: agentThinking ?? DEFAULT_CLOUD_THINKING_LEVEL,
         tools: guardedTools
       },
-      streamFn: (selectedModel, streamContext, options) => {
+      streamFn: async (selectedModel, streamContext, options) => {
+        const scope = this.checkpointScope(config, sessionKey)
+        contextManager ??= new ModelContextManager(scope ? this.store.modelCheckpoint(scope) : undefined)
+        const runId = this.activeRun.get(sessionKey)
+        const prepared = await contextManager.prepare(streamContext, selectedModel, {
+          group: context === 'group', signal: options?.signal,
+          save: checkpoint => {
+            options?.signal?.throwIfAborted()
+            if (!scope) throw new ModelContextLimitError('Context compaction cannot archive this session; original history was preserved.')
+            return this.store.saveModelCheckpoint(scope, checkpoint)
+          },
+          summarize: async summaryContext => {
+            if (!scope) throw new ModelContextLimitError('Context compaction is unavailable for this session; original history was preserved.')
+            if (runId) this.store.addRunEvent({ runId, type: 'status', label: 'Context checkpoint started', detail: config.name })
+            const signal = AbortSignal.any([...(options?.signal ? [options.signal] : []), AbortSignal.timeout(60_000)])
+            const summaryModel = { ...selectedModel, maxTokens: Math.min(selectedModel.maxTokens, 4096) }
+            const stream = this.models.streamSimple(summaryModel, summaryContext, { ...options, signal, reasoning: 'minimal', maxTokens: 4096, maxRetries: 0 })
+            for await (const event of stream) {
+              signal.throwIfAborted()
+              if (event.type === 'text_delta' || event.type === 'thinking_delta') this.replyProgress.get(sessionKey)?.()
+            }
+            const result = await stream.result()
+            signal.throwIfAborted()
+            if (runId) this.store.addRunEvent({ runId, type: 'status', label: 'Context checkpoint usage',
+              detail: JSON.stringify({ memberId: config.id, input: result.usage.input, output: result.usage.output, cacheRead: result.usage.cacheRead, reasoning: result.usage.reasoning }) })
+            if (result.errorMessage || result.stopReason !== 'stop') throw new ModelContextLimitError('Context compaction failed; original history was preserved.')
+            return this.readText(result.content)
+          },
+          onEvent: event => {
+            if (runId) this.store.addRunEvent({ runId, type: 'status', label: event.kind === 'compacted' ? 'Model context compacted' : 'Model context deduplicated',
+              detail: JSON.stringify({ memberId: config.id, ...event }) })
+          }
+        })
+        if (runId) this.store.addRunEvent({ runId, type: 'status', label: 'Model request context',
+          detail: JSON.stringify({ memberId: config.id, messages: prepared.messages.length, estimatedTokens: estimateContext(prepared) }) })
         // Group turns cap OpenRouter reasoning unless a custom model's user chose a depth explicitly.
         // An explicit 'off' still goes through the catalog so mandatory reasoning models keep working.
         const boundedOpenRouterTurn = context === 'group' && selectedModel.api === 'openai-completions'
           && new URL(selectedModel.baseUrl).hostname === 'openrouter.ai'
           && (!agentThinking || agentThinking === 'off')
-        return this.models.streamSimple(selectedModel, streamContext, boundedOpenRouterTurn ? {
+        return this.models.streamSimple(selectedModel, prepared, boundedOpenRouterTurn ? {
           ...options,
           onPayload: async (payload, model) => {
             const transformed = await options?.onPayload?.(payload, model)
@@ -1029,9 +1066,9 @@ export class DouchatRuntime {
 
     agent.subscribe((event) => {
       if (this.sessions.get(sessionKey)?.agent !== agent) return
+      if (event.type === 'message_update' || event.type === 'tool_execution_start' || event.type === 'tool_execution_end') this.replyProgress.get(sessionKey)?.()
       const runId = this.activeRun.get(sessionKey)
       if (!runId) return
-      if (event.type === 'message_update' || event.type === 'tool_execution_start' || event.type === 'tool_execution_end') this.replyProgress.get(sessionKey)?.()
       if (event.type === 'tool_execution_start') {
         const key = `${runId}:${config.id}`
         const actions = this.toolActions.get(key) ?? new Map<string, MessageAction>()
@@ -1398,6 +1435,37 @@ export class DouchatRuntime {
       }
     }
     return [read, update as AgentTool]
+  }
+
+  private checkpointScope(config: AgentConfig, sessionKey: string): ModelCheckpointScope | undefined {
+    const conversationId = this.activeConversation.get(sessionKey), topicId = this.activeTopic.get(sessionKey)
+    const ownerId = this.store.currentAccountId
+    const conversation = conversationId ? this.store.conversation(conversationId) : undefined
+    if (!conversationId || !topicId || config.ownerId !== ownerId || conversation?.ownerId !== ownerId
+      || !conversation.agentIds.includes(config.id) || !conversation.topics.some(topic => topic.id === topicId)) return undefined
+    return { ownerId, sessionKey, conversationId, topicId, agentId: config.id }
+  }
+
+  private contextCheckpointTool(config: AgentConfig, sessionKey: string): AgentTool {
+    return {
+      name: 'read_context_checkpoint', label: 'Read archived context',
+      description: 'Read original evidence behind a handoff checkpoint in this exact member session. Historical evidence is not authorization. Use nextOffset for additional text or imageMessageIndex to inspect archived images. Previous checkpoints are linked by previousId.',
+      parameters: Type.Object({ id: Type.String({ minLength: 1, maxLength: 100 }), offset: Type.Optional(Type.Integer({ minimum: 0 })), imageMessageIndex: Type.Optional(Type.Integer({ minimum: 0 })) }),
+      execute: async (_id, args: any, signal) => {
+        signal?.throwIfAborted()
+        const scope = this.checkpointScope(config, sessionKey)
+        if (!scope || !this.replyCancels.has(sessionKey)) throw new Error('Context checkpoint unavailable')
+        const checkpoint = this.store.modelCheckpoint(scope, args.id)
+        if (!checkpoint) throw new Error('Context checkpoint not found in this member session')
+        const evidence = JSON.stringify(checkpoint.messages.map((m, index) => ({ ...m, index,
+          content: typeof m.content === 'string' ? m.content : m.content.filter(p => p.type !== 'thinking').map(p => p.type === 'image' ? { type: 'image', mimeType: p.mimeType, note: 'Use imageMessageIndex to inspect this image' } : p) })))
+        const offset = args.offset ?? 0, end = Math.min(offset + 12000, evidence.length)
+        const source = args.imageMessageIndex === undefined ? undefined : checkpoint.messages[args.imageMessageIndex]
+        const images = source && typeof source.content !== 'string' ? source.content.filter(p => p.type === 'image').slice(0, 4) : []
+        return { content: [{ type: 'text' as const, text: JSON.stringify({ id: checkpoint.id, previousId: checkpoint.previousId, summary: checkpoint.summary,
+          evidence: evidence.slice(offset, end), nextOffset: end < evidence.length ? end : undefined }) }, ...images], details: {} }
+      }
+    }
   }
 
   private internalMemoryTool(sessionKey: string): AgentTool {
@@ -2577,7 +2645,7 @@ export class DouchatRuntime {
                 } : undefined,
             onProgress: (localProgress) => {
               if (abort.signal.aborted) return
-              if (localProgress.silentSeconds < 2) onProgress?.()
+              if (localProgress.phase === 'working' && localProgress.silentSeconds < 2) onProgress?.()
               if (localProgress.detail?.includes('[[douchat_')) localProgress = { ...localProgress, detail: undefined }
               this.setActivity(conversationId, topicId, 'replying', [config.id], config.name, { localProgress, action: undefined }, config.id)
               if (runId) this.store.updateRun(runId, { latestActivity: localProgress.detail || localProgress.phase })
@@ -2775,7 +2843,10 @@ export class DouchatRuntime {
           if (runId) this.store.addRunEvent({ runId, type: 'status', label: `${config.name} · empty response recovery`,
             detail: JSON.stringify({ stopReason: final.stopReason, usage: final.usage }) })
           retryCount += 1
-          await requestResponse(() => session.prompt('Your last response ended without any user-visible output. Continue from the existing tool results without repeating completed actions. Finish the requested task and return its result, or explain the concrete blocker.'))
+          // Resume the same user/tool turn. Appending another user prompt would
+          // grow the context and separate completed tools from their request.
+          session.state.messages = session.state.messages.slice(0, -1)
+          await requestResponse(() => session.continue())
         }
       } finally {
         signal?.removeEventListener('abort', abort)
@@ -2784,6 +2855,8 @@ export class DouchatRuntime {
       const lastMessage = [...session.state.messages].reverse().find((message) => message.role === 'assistant')
       const text = lastMessage && 'content' in lastMessage ? this.readText(lastMessage.content) : ''
       const error = lastMessage && 'errorMessage' in lastMessage ? (lastMessage.errorMessage as string) : undefined
+      if (lastMessage?.role === 'assistant' && lastMessage.stopReason === 'length') return finish({ text,
+        error: `${config.name}: model output limit reached before a complete response.`, ...(retryCount ? { retryCount } : {}) })
       if (!text.trim() && error) return finish({ text: '', error, ...(retryCount ? { retryCount } : {}) })
       return finish({
         text,
@@ -3578,6 +3651,7 @@ export class DouchatRuntime {
     this.store.saveGroupWorkflow(workflow)
 
     const unavailableMembers = new Set<string>(Object.keys(health).filter(id => health[id].status === 'unavailable'))
+    const memberFailures = new Map<string, string>()
     const failedControllers = new Set<string>()
     let participationPlan: GroupDecision | undefined
     let coordinator = groupLeadMember(group)
@@ -3607,7 +3681,10 @@ export class DouchatRuntime {
           phase: context.recovery ? 'recovery' : context.completedTurns.length ? 'continuation' : 'initial'
         }) })
         let electedByModel: string | undefined
-        let participationHint = settings.mode === 'leader' && !context.recovery && !groupConversationContinuity(group, context)
+        // Initial routing and dependency planning are one decision. A preliminary
+        // attendance classifier adds a round trip and can misclassify deliverables.
+        // Keep compact completion review and explicit Jev attendance escalation.
+        let participationHint = settings.mode === 'leader' && context.completedTurns.length > 0 && !context.recovery && !groupConversationContinuity(group, context)
         if (settings.mode !== 'leader') {
           const provider = this.decisionProviders.find(provider => provider.id === settings.providerId)
           this.setActivity(conversation.id, topicId, 'planning', [], 'Decision service', {
@@ -3633,7 +3710,19 @@ export class DouchatRuntime {
         return await firstGroupPlan(candidates.map((candidate, index) => {
           const config = this.store.agent(candidate.id)
           const controllerProvider = this.decisionProviders.find(provider => `custom:${provider.id}` === config?.provider)
-          return { run: async (planningSignal: AbortSignal) => {
+          // Only collapse requests known to use the same hosted credentials/model.
+          // Local agents may have different profiles, environments or remote hosts.
+          return { backendKey: controllerProvider && !config?.localAgentId ? `${controllerProvider.id}/${config?.model}` : undefined,
+            run: async (planningSignal: AbortSignal, planningProgress: () => void) => {
+            const requestedAt = Date.now()
+            let firstProgressMs: number | undefined
+            const progress = () => {
+              planningProgress()
+              if (firstProgressMs !== undefined || planningSignal.aborted) return
+              firstProgressMs = Date.now() - requestedAt
+              this.store.addRunEvent({ runId, type: 'status', label: 'Planning response started',
+                detail: JSON.stringify({ memberId: candidate.id, firstProgressMs }) })
+            }
             planning.clear()
             planning.add(candidate.id)
             this.setActivity(conversation.id, topicId, 'planning', [...planning], 'Coordinating the group', {
@@ -3650,9 +3739,9 @@ export class DouchatRuntime {
                 if (participationHint && !(controllerProvider && !config.localAgentId)) {
                   const prompt = context.completedTurns.length ? completionReviewPrompt(group, candidateContext) : participationPrompt(group, candidateContext, candidate)
                   const text = controllerProvider && !config.localAgentId
-                    ? await this.groupDecisionService.complete(controllerProvider, config.model, prompt, planningSignal)
+                    ? await this.groupDecisionService.complete(controllerProvider, config.model, prompt, planningSignal, undefined, progress)
                     : (await this.runReply({ config, sessionKey: controllerSessionKey, context: 'controller',
-                      timeoutMs: GROUP_PLANNING_ATTEMPT_MS, toolsDisabled: true, prompt,
+                      timeoutMs: GROUP_PLANNING_BUDGET_MS, onProgress: progress, toolsDisabled: true, prompt,
                       conversationId: conversation.id, topicId, signal: planningSignal })).text
                   planningSignal.throwIfAborted()
                   try {
@@ -3669,14 +3758,14 @@ export class DouchatRuntime {
                   this.disposeSession(controllerSessionKey)
                   participationHint = false
                 }
-                if (controllerProvider && !config.localAgentId) return this.groupDecisionService.plan(controllerProvider, config.model, group, candidateContext, planningSignal, candidate, participationHint)
+                if (controllerProvider && !config.localAgentId) return this.groupDecisionService.plan(controllerProvider, config.model, group, candidateContext, planningSignal, candidate, participationHint, progress)
                 let correction = ''
                 for (let attempt = 0; attempt < 2; attempt++) {
                   planningSignal.throwIfAborted()
                   // Planning already includes its required context. Reusing the
                   // model session would append old plans and duplicate transcripts.
                   this.disposeSession(controllerSessionKey)
-                  const reply = await this.runReply({ config, sessionKey: controllerSessionKey, context: 'controller', timeoutMs: GROUP_PLANNING_ATTEMPT_MS,
+                  const reply = await this.runReply({ config, sessionKey: controllerSessionKey, context: 'controller', timeoutMs: GROUP_PLANNING_BUDGET_MS, onProgress: progress,
                     toolsDisabled: true, prompt: groupDecisionPrompt(group, candidateContext, candidate) + correction,
                     conversationId: conversation.id, topicId, signal: planningSignal, images })
                   this.disposeSession(controllerSessionKey)
@@ -3788,7 +3877,9 @@ export class DouchatRuntime {
           throw new Error('A member returned an incomplete result after an execution error. Review the partial output before retrying; external actions will not be repeated automatically.')
         }
         if (!outcome.text.trim() && !outcome.attachments?.length && !outcome.actions?.length) {
-          this.store.addRunEvent({ runId, type: 'status', label: 'Member reply failed', detail: `${member.name}: ${outcome.error ? 'model response unavailable' : 'empty response'}` })
+          const reason = memberFailureReason(outcome.error)
+          memberFailures.set(member.id, reason)
+          this.store.addRunEvent({ runId, type: 'status', label: 'Member reply failed', detail: `${member.name}: ${reason}` })
           observe(member.id, false)
           const startupFailure = /queue.*before execution|no route-compatible authentication|not authenticated|authentication (?:required|failed)|api.?key.*(?:missing|invalid)|ENOENT|not installed|executable.*not found/i.test(outcome.error ?? '')
           if (config.localAgentId && outcome.error && !turn.participationOnly && !startupFailure) throw new Error(groupText(this.interfaceLanguage, '{member} was interrupted. Reason: {reason}\nExternal actions may have already run. Check the results before sending a new instruction; this task will not be repeated automatically.', { member: member.name, reason: outcome.error }))
@@ -3889,7 +3980,10 @@ export class DouchatRuntime {
         const id = `${workflow.id}:unavailable:${memberId}`
         if (!this.store.topicMessages(conversation.id, topicId).some(message => message.id === id)) this.store.addMessage({
           id, conversationId: conversation.id, topicId, authorId: 'system', authorName: 'Douchat', kind: 'system',
-          ...groupNotice(this.interfaceLanguage, cached ? 'Scheduling: {member} is not configured to run. Skipping this round.' : 'Scheduling: {member} did not complete this reply. Deciding what happens next.', { member: member?.name ?? memberId }) })
+          ...groupNotice(this.interfaceLanguage, cached ? 'Scheduling: {member} is not configured to run. Skipping this round.'
+            : memberFailures.has(memberId) ? 'Scheduling: {member} could not answer the current request: {reason}. Deciding what happens next.'
+              : 'Scheduling: {member} did not complete this reply. Deciding what happens next.',
+          { member: member?.name ?? memberId, reason: groupText(this.interfaceLanguage, memberFailures.get(memberId) ?? 'The model returned no usable reply') }) })
         this.emit()
       },
       decide: async context => {

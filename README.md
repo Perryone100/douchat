@@ -10,6 +10,7 @@
 
 <p align="center">
   <a href="docs/fork-overview.zh-CN.md">中文使用与维护说明</a> ·
+  <a href="docs/versions.zh-CN.md">版本记录</a> ·
   <a href="https://github.com/Perryone100/douchat/pull/1">超时修复 PR</a> ·
   <a href="https://douchat.ai">Upstream website</a> ·
   <a href="#quick-start">Quick start</a> ·
@@ -30,7 +31,7 @@
 | 入口 | 内容 |
 | --- | --- |
 | [`dev`](https://github.com/Perryone100/douchat/tree/dev) | 默认分支：上游 v0.1.24 基线及本 Fork 的说明文档；尚未合入超时修复。 |
-| [`codex/fix-planning-timeouts`](https://github.com/Perryone100/douchat/tree/codex/fix-planning-timeouts) | 可从源码运行的修复版，包含流式规划、进度感知超时、失败切换及回归测试。 |
+| [`codex/fix-planning-timeouts`](https://github.com/Perryone100/douchat/tree/codex/fix-planning-timeouts) | 可从源码运行的修复版，包含流式规划、进度感知超时、失败切换、上下文去重与交接摘要及回归测试。 |
 | [PR #1](https://github.com/Perryone100/douchat/pull/1) | 修复代码和验证依据；当前为草稿 PR，是否合并以 PR 页面为准。 |
 
 **体验修复版请使用下方 Quick start 中指定的分支。** 本 Fork 暂未发布安装包；
@@ -42,9 +43,10 @@
 - 传输失败与计划格式错误分别处理，避免对同一个已失败的模型后端反复换人重试。
 - 默认成员协调一次生成完整分工，减少开始工作前的串行模型调用。
 - 保留已有的任务依赖执行、步骤持久化、取消和权限确认，并补充可复现的测试。
+- 长对话先精确去重，再按需生成可恢复的交接摘要，预留回答空间并保存原文；区分上下文、输出上限与超时提示，详见 [上下文预算与成本](docs/model-context-budget.md)。
 
-已完成本地自动测试 **1,392 项通过、4 项跳过**，以及 DeepSeek 五任务依赖流程、
-DeepSeek + 本地 Codex 三阶段交接的实测。实测耗时、测试边界、配置与故障定位见
+已完成本地自动测试 **1,413 项通过、4 项跳过**，以及 DeepSeek 五任务依赖流程、
+DeepSeek + 本地 Codex 三阶段交接的规划修复实测。新增语义摘要流程仅完成模拟模型验证，未额外消耗真实 API 余额；触发摘要会产生正常模型用量。实测耗时、测试边界、配置与故障定位见
 [中文说明](docs/fork-overview.zh-CN.md)，实现细节见
 [规划可靠性文档](https://github.com/Perryone100/douchat/blob/codex/fix-planning-timeouts/docs/group-planning-reliability.md)。
 
