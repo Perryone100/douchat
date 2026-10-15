@@ -151,6 +151,9 @@ export class GroupDecisionService {
   async complete(provider: DecisionProvider, model: string, prompt: string, signal: AbortSignal, schema?: object, onProgress?: () => void): Promise<string> {
     const reasoning = new URL(provider.apiBase).hostname === 'openrouter.ai' ? await this.openRouterReasoning(model, signal) : undefined
     const structured = schema && reasoning && this.structuredModels.has(model) && provider.kind === 'openai'
+    // DeepSeek JSON mode requires an explicit JSON instruction on every request,
+    // including secondary no-reply reviews: https://api-docs.deepseek.com/guides/json_mode/
+    const deepSeekJson = provider.kind === 'openai' && new URL(provider.apiBase).hostname === 'api.deepseek.com' && Boolean(schema)
     const body = {
       model, max_tokens: 8192, stream: true,
       // Planning is an independent, tool-free workload. Do not silently inherit
@@ -159,7 +162,7 @@ export class GroupDecisionService {
         ? { thinking: { type: 'enabled' }, reasoning_effort: 'low', ...(schema ? { response_format: { type: 'json_object' } } : {}) } : {}),
       ...(reasoning ? { reasoning } : {}),
       ...(structured ? { response_format: { type: 'json_schema', json_schema: { name: 'group_decision', strict: true, schema } }, provider: { require_parameters: true } } : {}),
-      messages: [{ role: 'user', content: prompt }]
+      messages: [{ role: 'user', content: deepSeekJson ? `${prompt}\nReturn only a valid JSON object, without Markdown fences or extra text.` : prompt }]
     }
     let data: any
     try { data = await this.post(customEndpoint(provider.apiBase, provider.kind), provider, body, signal, GROUP_PLANNING_BUDGET_MS, onProgress) }
